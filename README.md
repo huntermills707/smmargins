@@ -1,0 +1,172 @@
+# `marginal_effects` — Stata-style `margins` for StatsModels
+
+A small module that fills in the marginal-effects gaps in StatsModels:
+adjusted predictions and marginal effects at user-specified covariate
+profiles, with delta-method standard errors, for *any* fitted model that
+exposes `params`, `cov_params()`, and a `predict(params, exog)` method.
+
+## Math
+
+The delta method: for a parameter vector $\hat\beta$ with estimated
+covariance $\widehat V$, and a (possibly vector-valued) statistic
+$g(\beta)$,
+
+$$
+\widehat{\operatorname{Var}}\bigl[g(\hat\beta)\bigr]
+\;\approx\; G\,\widehat V\,G^\top,
+\qquad
+G = \left.\frac{\partial g}{\partial \beta}\right|_{\hat\beta}.
+$$
+
+This is exactly the approach documented in
+[Stata's margins-delta-method FAQ](https://www.stata.com/support/faqs/statistics/compute-standard-errors-with-margins/).
+The cases in [Richard Williams' *Margins01* notes](https://academicweb.nd.edu/~rwilliam/stats/Margins01.pdf)
+all fit the $g(\beta)$ schema:
+
+| Statistic | $g(\beta)$                                                              |
+|-----------|-------------------------------------------------------------------------|
+| AAP       | $\frac{1}{n}\sum_i f(x_i^\top\beta)$                                    |
+| APM       | $f(\bar x^\top\beta)$                                                   |
+| APR       | $\frac{1}{n}\sum_i f(x_i^\top\beta)$ with some $x$ fixed                |
+| AME       | $\frac{1}{n}\sum_i \partial f(x_i^\top\beta)/\partial x_{ij}$           |
+| MEM       | $\partial f(\bar x^\top\beta)/\partial x_j$                             |
+| MER       | AME / AAP with some $x$ held at representative values                   |
+| Contrast  | $E[f(\cdot)\mid x_j=\text{level}] - E[f(\cdot)\mid x_j=\text{ref}]$     |
+
+where $f$ is the response-scale map (identity for OLS, inverse link for
+GLMs, etc.). The module obtains $G$ by central finite differences of
+$g$ with respect to $\beta$, so the same code handles every model.
+
+## Why patsy
+
+When we want the marginal effect of `x1` and the formula is
+`y ~ x1 + I(x1**2) + x1:x2 + C(group)`, we can't just nudge one column
+of the design matrix — `x1` enters three columns. What we *can* nudge
+is the `x1` column of the **original data frame**, and then ask patsy to
+rebuild the design matrix using the stored `DesignInfo`:
+
+```python
+patsy.dmatrix(design_info, perturbed_frame, return_type="matrix")
+```
+
+That preserves polynomial terms, interactions, splines (`bs(x, df=4)`),
+and categorical contrasts automatically. It's also the right abstraction
+for "hold `age=45`" or "set `group='b'`" — you mutate the data frame,
+not the design matrix.
+
+## API
+
+```python
+from marginal_effects import Margins
+
+M = Margins(fit)                 # fit is a statsmodels results object
+
+# --- adjusted predictions ---
+M.predict()                      # AAP
+M.predict(atmeans=True)          # APM
+M.predict(at={"x1": [0, 1, 2]})  # APR (table; others at observed values)
+M.predict(at={"x1": [0, 1, 2]}, atmeans=True)  # APR holding others at means
+
+# --- marginal effects ---
+M.dydx("x1")                     # AME (continuous auto-detected)
+M.dydx("x1", atmeans=True)       # MEM
+M.dydx("x1", at={"x2": [0, 1]})  # MER
+M.dydx("group")                  # discrete contrasts vs reference level
+M.dydx("group", reference="b")   # discrete contrasts vs "b"
+```
+
+Each call returns a `MarginsResult` with `.estimate`, `.se`, `.vcov`,
+`.ci_lower`, `.ci_upper`, `.pvalue`, plus `.summary()` returning a
+DataFrame. Use `use_t=True` on the `Margins` constructor if you want
+t-distribution inference (reads `results.df_resid`).
+
+## Design choices worth knowing
+
+1. **`atmeans` acts on the data frame, not the design matrix.** For
+   numeric columns we use the column mean; for categoricals we use the
+   modal level. This differs from Stata, whose `atmeans` averages the
+   *design matrix* (i.e. factor dummies get held at their sample
+   proportions — a "person" who is 0.33 female). If you want Stata's
+   behavior exactly, encode factors as numeric dummies before fitting;
+   the test suite (`test_margins.py`) demonstrates this matches
+   `statsmodels.get_margeff(at='mean')` to machine precision. Williams
+   himself notes that atmeans-on-dummies is usually a worse choice than
+   AME, and we side with him by default.
+
+2. **`dydx` is response-scale by default.** For GLMs this means
+   $\partial\hat\mu / \partial x$, not $\partial\hat\eta / \partial x$.
+   This matches Stata's default and is almost always what's wanted.
+
+3. **Discrete vs continuous is auto-detected**, based on dtype and number
+   of unique values. Override with `discrete=True`/`False` if needed.
+
+4. **Numerical differentiation** uses central differences with
+   $h = \epsilon^{1/3}\cdot\max(|x|, 1)$ — the theoretically optimal
+   trade-off between truncation and rounding error for central
+   differences. For the $\partial g/\partial\beta$ step we use the same
+   rule on $\beta$. Tests show we recover analytic SEs to 5–6 decimal
+   places.
+
+5. **Everything goes through `model.predict(params, exog)`.** That way
+   the inverse link, offsets, exposures, and any other model-specific
+   wrinkles handled by StatsModels come along for the ride for free.
+
+## Verification
+
+`test_margins.py` checks the module against:
+
+- An **OLS with polynomial + interaction**, where the analytic AME is
+  $\beta_1 + 2\beta_2\,\overline{x_1} + \beta_4\,\overline{x_2}$ and its
+  SE is $\sqrt{g^\top V g}$. Matches to machine precision.
+- **Logit AME**, compared against `statsmodels.get_margeff(at='overall')`.
+  Matches to $10^{-5}$ on estimate and SE.
+- **Logit MEM with dummies**, compared against `get_margeff(at='mean')`.
+  Matches to $10^{-5}$ on estimate and SE.
+- **Poisson AAP** with hand-derived $g$ gradient. Matches exactly; and
+  sanity-checks that AAP equals the sample mean for canonical-link
+  Poisson.
+
+## Difference-in-differences
+
+Two small additions turn the module into a full DiD estimator:
+
+- `MarginsResult.contrast(c, labels=None)` forms any linear combination
+  of the estimates, using $c^\top V_m c$ directly on the already-computed
+  joint covariance. Exact under the same delta-method approximation; no
+  extra differentiation.
+- `Margins.did(group, condition, ...)` sets up the 2×2 grid and returns
+  a `DiDResult` bundling the four cell predictions, the two simple
+  effects, and the DiD — all sharing the same joint covariance (so you
+  can test them jointly through `result.joint.vcov`).
+
+```python
+M = Margins(fit)
+res = M.did("group", "preexist_Y",
+            group_levels=["A", "B"], condition_levels=[0, 1],
+            at={"age": 60, "female": 0})  # optional: fix covariates
+print(res)          # shows cells + simple effects + DiD
+res.did.estimate    # the DiD point estimate
+res.did.ci_lower    # lower 95% CI
+res.cells.vcov      # 4x4 joint covariance of the cell predictions
+```
+
+**Why this matters for nonlinear models (Ai & Norton, 2003).** In a
+logit, the coefficient on the `group × condition` interaction is on the
+*log-odds* scale. On the *probability* scale the DiD is a nonlinear
+function of every parameter and every covariate profile — you cannot
+read it off the interaction coefficient. `test_did.py` verifies:
+
+- On **OLS**, `did()` returns exactly the interaction coefficient with
+  exactly its SE (matches to 1e-8).
+- On **logit**, `did()` returns something *very different* from the
+  interaction coefficient (e.g. −0.676 on log-odds vs −0.147 on
+  probability in one test run), and matches a by-hand four-cell
+  computation to 1e-10.
+
+## Files
+
+- `marginal_effects.py` — the module.
+- `test_margins.py`    — correctness tests for predictions and marginal effects.
+- `test_did.py`        — correctness tests for DiD and contrasts.
+- `demo_margins.py`    — Williams-style walkthrough on a simulated dataset.
+- `demo_did.py`        — healthcare-style 2×2 DiD walkthrough.
