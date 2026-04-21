@@ -12,7 +12,7 @@ covariance $\widehat V$, and a (possibly vector-valued) statistic
 $g(\beta)$,
 
 $$
-\widehat{\operatorname{Var}}\bigl[g(\hat\beta)\bigr]
+\widehat{\mathrm{Var}}\bigl[g(\hat\beta)\bigr]
 \;\approx\; G\,\widehat V\,G^\top,
 \qquad
 G = \left.\frac{\partial g}{\partial \beta}\right|_{\hat\beta}.
