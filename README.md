@@ -69,10 +69,14 @@ M.predict(at={"x1": [0, 1, 2]}, atmeans=True)  # APR holding others at means
 
 # --- marginal effects ---
 M.dydx("x1")                     # AME (continuous auto-detected)
-M.dydx("x1", atmeans=True)       # MEM
+M.dydx("x1", atmeans=True)       # MEM (Stata-style: factors at proportions)
 M.dydx("x1", at={"x2": [0, 1]})  # MER
 M.dydx("group")                  # discrete contrasts vs reference level
 M.dydx("group", reference="b")   # discrete contrasts vs "b"
+
+# --- atmeans: Stata-style by default, mode opt-in ---
+M.predict(atmeans=True)                       # factor dummies at observed proportions
+M.predict(atmeans=True, factor_stat="mode")   # factors held at modal level instead
 ```
 
 Each call returns a `MarginsResult` with `.estimate`, `.se`, `.vcov`,
@@ -82,16 +86,17 @@ t-distribution inference (reads `results.df_resid`).
 
 ## Design choices worth knowing
 
-1. **`atmeans` acts on the data frame, not the design matrix.** For
-   numeric columns we use the column mean; for categoricals we use the
-   modal level. This differs from Stata, whose `atmeans` averages the
-   *design matrix* (i.e. factor dummies get held at their sample
-   proportions — a "person" who is 0.33 female). If you want Stata's
-   behavior exactly, encode factors as numeric dummies before fitting;
-   the test suite (`test_margins.py`) demonstrates this matches
-   `statsmodels.get_margeff(at='mean')` to machine precision. Williams
-   himself notes that atmeans-on-dummies is usually a worse choice than
-   AME, and we side with him by default.
+1. **`atmeans` averages the design matrix by default.** This matches
+   Stata's `margins, atmeans` and statsmodels' `get_margeff(at='mean')`:
+   numeric columns become their sample mean, factor dummies become their
+   observed proportions (a "person" who is 0.33 female). The test suite
+   verifies a match to `statsmodels.get_margeff(at='mean')` to machine
+   precision. Pass `factor_stat="mode"` to fall back to the alternative
+   behavior — numeric columns at their mean, factors held at their modal
+   level — which gives a "typical individual" rather than a fictional
+   fractional one. Williams (Margins01) notes that atmeans-on-dummies is
+   usually a worse choice than AME regardless of which convention you
+   pick, so prefer AME for factor-heavy models.
 
 2. **`dydx` is response-scale by default.** For GLMs this means
    $\partial\hat\mu / \partial x$, not $\partial\hat\eta / \partial x$.
@@ -120,8 +125,10 @@ t-distribution inference (reads `results.df_resid`).
   SE is $\sqrt{g^\top V g}$. Matches to machine precision.
 - **Logit AME**, compared against `statsmodels.get_margeff(at='overall')`.
   Matches to $10^{-5}$ on estimate and SE.
-- **Logit MEM with dummies**, compared against `get_margeff(at='mean')`.
-  Matches to $10^{-5}$ on estimate and SE.
+- **Logit MEM**, compared against `get_margeff(at='mean')` on a formula
+  with a `C(grp)` factor. Matches to $10^{-5}$ on estimate and SE under
+  the default `factor_stat="mean"`. A separate hand-computed check covers
+  the `factor_stat="mode"` path.
 - **Poisson AAP** with hand-derived $g$ gradient. Matches exactly; and
   sanity-checks that AAP equals the sample mean for canonical-link
   Poisson.
