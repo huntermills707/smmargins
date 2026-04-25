@@ -378,12 +378,11 @@ class Margins:
     def _means_row(self, frame: pd.DataFrame) -> pd.DataFrame:
         """One-row frame: mean for numeric columns, mode for the rest.
 
-        Note: this is what "atmeans" means *on the original data frame*.
-        Stata's ``atmeans`` works on the *design matrix* (so for a factor
-        variable it uses observed proportions of each dummy). To replicate
-        that behavior exactly, encode factor variables as numeric dummies
-        before fitting. Williams (Margins01) discusses why atmeans on
-        dummies is often a questionable choice anyway and recommends AME.
+        Used when ``factor_stat="mode"`` — gives a "modal typical
+        individual" rather than a fictional fractional one. The default
+        ``factor_stat="mean"`` path bypasses this and instead averages
+        the design matrix directly (matching Stata's ``margins, atmeans``
+        and statsmodels' ``get_margeff(at='mean')``).
         """
         row = {}
         for c in frame.columns:
@@ -396,6 +395,13 @@ class Margins:
                 except Exception:
                     row[c] = col.iloc[0]
         return pd.DataFrame([row])
+
+    @staticmethod
+    def _check_factor_stat(factor_stat: str) -> None:
+        if factor_stat not in ("mean", "mode"):
+            raise ValueError(
+                f"factor_stat must be 'mean' or 'mode', got {factor_stat!r}"
+            )
 
     # ---- the delta-method worker ----
 
@@ -426,6 +432,7 @@ class Margins:
         self,
         at: Optional[Mapping[str, object]] = None,
         atmeans: bool = False,
+        factor_stat: str = "mean",
     ) -> MarginsResult:
         """Adjusted predictions (expected outcome on the response scale).
 
@@ -437,8 +444,21 @@ class Margins:
             (unless ``atmeans=True``, in which case others go to their means).
             Lists are expanded as a cartesian product.
         atmeans : bool
-            If True, compute at the means/mode of all variables (modified by
+            If True, compute at the means of all variables (modified by
             any ``at=`` overrides) rather than averaging over the sample.
+        factor_stat : {"mean", "mode"}, default "mean"
+            How to summarize non-numeric / categorical variables when
+            ``atmeans=True``.
+
+            - ``"mean"`` (default): average the *design matrix* (so each
+              dummy column gets its observed proportion). Matches Stata's
+              ``margins, atmeans`` and statsmodels'
+              ``get_margeff(at='mean')``.
+            - ``"mode"``: pick the modal level of each factor on the
+              original data frame, giving a "typical individual" rather
+              than a fictional fractional one.
+
+            Ignored when ``atmeans=False``.
 
         Returns
         -------
@@ -455,7 +475,12 @@ class Margins:
         APM + at                      True         dict  (others at means)
         ============================  ===========  ==========
         """
-        base = self._means_row(self.data) if atmeans else self.data
+        self._check_factor_stat(factor_stat)
+        collapse = atmeans and factor_stat == "mean"
+        if atmeans and factor_stat == "mode":
+            base = self._means_row(self.data)
+        else:
+            base = self.data
         frames, at_labels = self._expand_at(base, at)
 
         if at is None and not atmeans:
@@ -472,6 +497,8 @@ class Margins:
             out = np.empty(len(frames))
             for i, f in enumerate(frames):
                 X = self._build_exog(f)
+                if collapse:
+                    X = X.mean(axis=0, keepdims=True)
                 out[i] = float(np.mean(self._predict(beta, X)))
             return out
 
@@ -489,6 +516,7 @@ class Margins:
         discrete: Optional[bool] = None,
         step: Optional[float] = None,
         reference: Optional[object] = None,
+        factor_stat: str = "mean",
     ) -> MarginsResult:
         """Marginal effect of ``variable`` on the response.
 
@@ -496,7 +524,7 @@ class Margins:
         ----------
         variable : str
             Column name in the fitting data frame.
-        at, atmeans : see :meth:`predict`.
+        at, atmeans, factor_stat : see :meth:`predict`.
         discrete : bool, optional
             If True, use discrete changes (level vs reference).
             If False, use a numerical derivative.
@@ -524,6 +552,7 @@ class Margins:
         MER (eff. at rep. values)     False        dict
         ============================  ===========  ==========
         """
+        self._check_factor_stat(factor_stat)
         col = self.data[variable]
 
         if discrete is None:
@@ -535,15 +564,21 @@ class Margins:
             else:
                 discrete = False
 
-        base = self._means_row(self.data) if atmeans else self.data
+        collapse = atmeans and factor_stat == "mean"
+        if atmeans and factor_stat == "mode":
+            base = self._means_row(self.data)
+        else:
+            base = self.data
         frames, at_labels = self._expand_at(base, at)
 
         if discrete:
             return self._dydx_discrete(
-                variable, frames, at_labels, reference=reference
+                variable, frames, at_labels, reference=reference,
+                collapse=collapse,
             )
         return self._dydx_continuous(
-            variable, frames, at_labels, step=step, atmeans=atmeans
+            variable, frames, at_labels, step=step, atmeans=atmeans,
+            collapse=collapse,
         )
 
     # ----- continuous case (numerical derivative) ---------------------------
@@ -555,6 +590,7 @@ class Margins:
         at_labels: List[str],
         step: Optional[float],
         atmeans: bool,
+        collapse: bool = False,
     ) -> MarginsResult:
         if step is None:
             sd = float(self.data[variable].std(ddof=0))
@@ -570,6 +606,9 @@ class Margins:
                 f_minus[variable] = f_minus[variable].astype(float) - h
                 Xp = self._build_exog(f_plus)
                 Xm = self._build_exog(f_minus)
+                if collapse:
+                    Xp = Xp.mean(axis=0, keepdims=True)
+                    Xm = Xm.mean(axis=0, keepdims=True)
                 return float(np.mean(
                     (self._predict(beta, Xp) - self._predict(beta, Xm)) / (2.0 * h)
                 ))
@@ -595,6 +634,7 @@ class Margins:
         frames: List[pd.DataFrame],
         at_labels: List[str],
         reference: Optional[object],
+        collapse: bool = False,
     ) -> MarginsResult:
         levels = self.data[variable].dropna().unique().tolist()
         try:
@@ -613,6 +653,9 @@ class Margins:
                 f_lvl = frame.copy(); f_lvl[variable] = lvl
                 Xr = self._build_exog(f_ref)
                 Xl = self._build_exog(f_lvl)
+                if collapse:
+                    Xr = Xr.mean(axis=0, keepdims=True)
+                    Xl = Xl.mean(axis=0, keepdims=True)
                 return float(np.mean(self._predict(beta, Xl))
                              - np.mean(self._predict(beta, Xr)))
             return s
@@ -642,6 +685,7 @@ class Margins:
         condition_levels: Optional[Sequence] = None,
         at: Optional[Mapping[str, object]] = None,
         atmeans: bool = False,
+        factor_stat: str = "mean",
     ) -> "DiDResult":
         """Difference-in-differences on the response scale.
 
@@ -663,7 +707,9 @@ class Margins:
         at : dict, optional
             Extra covariates to fix (see :meth:`predict`).
         atmeans : bool
-            If True, evaluate at means/mode of everything else.
+            If True, evaluate at means of everything else.
+        factor_stat : {"mean", "mode"}, default "mean"
+            See :meth:`predict`.
 
         Returns
         -------
@@ -693,7 +739,7 @@ class Margins:
         # with condition varying fastest: (g0,c0),(g0,c1),(g1,c0),(g1,c1)
         at_full[group] = g
         at_full[condition] = c
-        cells = self.predict(at=at_full, atmeans=atmeans)
+        cells = self.predict(at=at_full, atmeans=atmeans, factor_stat=factor_stat)
 
         # Rewrite the cell labels to the compact "(group=A, condition=0)" form
         cells.labels = [

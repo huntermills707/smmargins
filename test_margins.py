@@ -122,31 +122,40 @@ print(f"x1 from delta      : me={ame.estimate[0]:.8f}  se={ame.se[0]:.8f}")
 assert np.isclose(ame.estimate[0], sm_x1_me, atol=1e-5)
 assert np.isclose(ame.se[0], sm_x1_se, rtol=1e-3)
 
-# MEM: evaluate at means
+# MEM: evaluate at means.  Default factor_stat="mean" matches Stata /
+# statsmodels: design-matrix means (i.e. observed proportions for dummies).
 mem_x1 = ML.dydx("x1", atmeans=True)
 mfx_mean = logit.get_margeff(at="mean", method="dydx")
 sm_x1_mem = mfx_mean.margeff[x1_pos]
 sm_x1_mem_se = mfx_mean.margeff_se[x1_pos]
 print(f"\nMEM(x1) statsmodels: {sm_x1_mem:.8f} (se {sm_x1_mem_se:.8f})")
 print(f"MEM(x1) delta      : {mem_x1.estimate[0]:.8f} (se {mem_x1.se[0]:.8f})")
-# statsmodels atmeans uses design-matrix means (proportions for dummies).
-# Our atmeans uses mode of the factor. So these should match ONLY when the
-# factor variables are truly at their mode. We will instead verify the *AME*
-# match above and demonstrate MEM as a modelling choice.
-# Force Stata-style dummy-means by running on dummies directly:
-df_d = df.copy()
-df_d["gb"] = (df_d["grp"] == "b").astype(float)
-df_d["gc"] = (df_d["grp"] == "c").astype(float)
-logit2 = smf.logit("yb ~ x1 + x2 + gb + gc", data=df_d).fit(disp=False)
-ML2 = Margins(logit2)
-mem2 = ML2.dydx("x1", atmeans=True)
-mfx_mean2 = logit2.get_margeff(at="mean", method="dydx")
-sm_mem2 = mfx_mean2.margeff[0]
-sm_mem2_se = mfx_mean2.margeff_se[0]
-print(f"\nWith dummies: MEM(x1) statsmodels: {sm_mem2:.8f} (se {sm_mem2_se:.8f})")
-print(f"With dummies: MEM(x1) delta      : {mem2.estimate[0]:.8f} (se {mem2.se[0]:.8f})")
-assert np.isclose(mem2.estimate[0], sm_mem2, atol=1e-5)
-assert np.isclose(mem2.se[0], sm_mem2_se, rtol=1e-3)
+assert np.isclose(mem_x1.estimate[0], sm_x1_mem, atol=1e-5)
+assert np.isclose(mem_x1.se[0], sm_x1_mem_se, rtol=1e-3)
+
+# factor_stat="mode" path: factors held at their modal level. This is the
+# old behavior and should differ from statsmodels whenever a non-modal
+# factor level has nontrivial proportion. Sanity-check it against a hand
+# computation on the modal factor row.
+mem_x1_mode = ML.dydx("x1", atmeans=True, factor_stat="mode")
+modal_grp = df["grp"].mode().iloc[0]
+row = pd.DataFrame([{
+    "x1": df["x1"].mean(), "x2": df["x2"].mean(),
+    "grp": modal_grp, "dummy": df["dummy"].mean(),
+}])
+h = (np.finfo(float).eps ** (1.0 / 3.0)) * max(
+    df["x1"].std(ddof=0), abs(df["x1"].mean()), 1.0
+)
+rp = row.copy(); rp["x1"] = rp["x1"] + h
+rm = row.copy(); rm["x1"] = rm["x1"] - h
+Xp = ML._build_exog(rp); Xm = ML._build_exog(rm)
+hand_mode = float(
+    (logit.model.predict(logit.params, Xp)[0]
+     - logit.model.predict(logit.params, Xm)[0]) / (2.0 * h)
+)
+print(f"MEM(x1, mode) hand : {hand_mode:.8f}")
+print(f"MEM(x1, mode) delta: {mem_x1_mode.estimate[0]:.8f}")
+assert np.isclose(mem_x1_mode.estimate[0], hand_mode, atol=1e-6)
 
 # ---------------------------------------------------------------------------
 # 4. Discrete contrast for factor variable
