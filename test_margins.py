@@ -272,6 +272,82 @@ assert Margins(logit)._link_deriv() is not None
 assert Margins(pois)._link_deriv() is not None
 assert Margins(ols, analytic=False)._link_deriv() is None
 
+# ---------------------------------------------------------------------------
+# 7. Elasticities (eyex, dyex, eydx) — parity with statsmodels.get_margeff
+#    These methods scale the per-observation dy/dx by x_i and/or 1/y_i
+#    before averaging. We verify against statsmodels' analytic
+#    implementation on Logit (overall = AME-style) and on Poisson, and
+#    check that elasticities on a discrete variable raise.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 72)
+print("TEST 6 : elasticities vs get_margeff")
+print("=" * 72)
+
+# Logit / x1 — the row position in get_margeff's output is x1_pos from
+# section 3 above. ``method='dydx'`` is already covered by TEST 2.
+for elas in ("eyex", "dyex", "eydx"):
+    ours_ame = ML.dydx("x1", method=elas)
+    sm_ame = logit.get_margeff(at="overall", method=elas)
+    sm_e = sm_ame.margeff[x1_pos]
+    sm_se = sm_ame.margeff_se[x1_pos]
+    print(f"  Logit  AME {elas} (x1):  ours={ours_ame.estimate[0]:+.6f} "
+          f"se={ours_ame.se[0]:.6f}   sm={sm_e:+.6f} se={sm_se:.6f}")
+    assert np.isclose(ours_ame.estimate[0], sm_e, atol=1e-5), (
+        f"{elas} AME estimate mismatch")
+    assert np.isclose(ours_ame.se[0], sm_se, rtol=1e-3), (
+        f"{elas} AME SE mismatch")
+
+    ours_mem = ML.dydx("x1", atmeans=True, method=elas)
+    sm_mem = logit.get_margeff(at="mean", method=elas)
+    sm_e_m = sm_mem.margeff[x1_pos]
+    sm_se_m = sm_mem.margeff_se[x1_pos]
+    print(f"  Logit  MEM {elas} (x1):  ours={ours_mem.estimate[0]:+.6f} "
+          f"se={ours_mem.se[0]:.6f}   sm={sm_e_m:+.6f} se={sm_se_m:.6f}")
+    assert np.isclose(ours_mem.estimate[0], sm_e_m, atol=1e-5), (
+        f"{elas} MEM estimate mismatch")
+    assert np.isclose(ours_mem.se[0], sm_se_m, rtol=1e-3), (
+        f"{elas} MEM SE mismatch")
+
+# Cross-model: Poisson elasticities (canonical exp link)
+for elas in ("eyex", "dyex", "eydx"):
+    ours_p = MP.dydx("x1", method=elas)
+    sm_p = pois.get_margeff(at="overall", method=elas)
+    pois_x1_pos = [n for n in pois.model.exog_names if n != "Intercept"].index("x1")
+    sm_pe = sm_p.margeff[pois_x1_pos]
+    sm_pse = sm_p.margeff_se[pois_x1_pos]
+    print(f"  Pois   AME {elas} (x1):  ours={ours_p.estimate[0]:+.6f} "
+          f"se={ours_p.se[0]:.6f}   sm={sm_pe:+.6f} se={sm_pse:.6f}")
+    assert np.isclose(ours_p.estimate[0], sm_pe, atol=1e-5)
+    assert np.isclose(ours_p.se[0], sm_pse, rtol=1e-3)
+
+# Stata-style sanity: for Poisson with canonical link, eyex(x_j) =
+# beta_j * mean(x_j) when evaluated at means. This isn't exactly what
+# AME-eyex is (it averages eyex_i, not eyex at means), so we use MEM:
+mem_eyex = MP.dydx("x1", atmeans=True, method="eyex")
+hand_eyex_mem = pois.params["x1"] * df["x1"].mean()
+print(f"\n  Pois   MEM eyex (x1):  ours={mem_eyex.estimate[0]:+.6f}  "
+      f"hand=β1·mean(x1)={hand_eyex_mem:+.6f}")
+assert np.isclose(mem_eyex.estimate[0], hand_eyex_mem, atol=1e-6)
+
+# Elasticities on a discrete variable must raise.
+err = None
+try:
+    ML.dydx("grp", method="eyex")
+except ValueError as e:
+    err = e
+assert err is not None, "expected ValueError on discrete + method='eyex'"
+print(f"\n  discrete-elasticity guard: ValueError raised as expected")
+
+# Bad method names raise too.
+err = None
+try:
+    ML.dydx("x1", method="bogus")
+except ValueError as e:
+    err = e
+assert err is not None, "expected ValueError on unknown method"
+print(f"  unknown-method guard:      ValueError raised as expected")
+
 print("\n" + "=" * 72)
 print("ALL TESTS PASSED")
 print("=" * 72)

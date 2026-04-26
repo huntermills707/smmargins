@@ -86,6 +86,12 @@ M.dydx("x1", at={"x2": [0, 1]})  # MER
 M.dydx("group")                  # discrete contrasts vs reference level
 M.dydx("group", reference="b")   # discrete contrasts vs "b"
 
+# --- elasticities (continuous only) ---
+M.dydx("x1", method="eyex")      # full elasticity:    ey/ex = (dy/dx)·x/y
+M.dydx("x1", method="dyex")      # semi-elasticity:    dy/ex = (dy/dx)·x
+M.dydx("x1", method="eydx")      # semi-elasticity:    ey/dx = (dy/dx)/y
+# Combine with atmeans/at as usual; raises on discrete variables.
+
 # --- atmeans: Stata-style by default, mode opt-in ---
 M.predict(atmeans=True)                       # factor dummies at observed proportions
 M.predict(atmeans=True, factor_stat="mode")   # factors held at modal level instead
@@ -169,6 +175,12 @@ M = Margins(fit, analytic=False)  # force central finite differences everywhere
   SE. This guards against the analytic chain-rule formula drifting
   from the FD answer that the other tests pin to Stata /
   `get_margeff`.
+- **Elasticities (`eyex`, `dyex`, `eydx`)** matched against
+  `statsmodels.get_margeff(method=...)` for both AME-style (`at='overall'`)
+  and MEM-style (`at='mean'`), on Logit and Poisson, to $10^{-5}$ on
+  estimates and $10^{-3}$ on SEs. Plus a hand check that Poisson MEM
+  $\mathrm{ey/ex}(x_1)=\beta_1\,\overline{x_1}$ for the canonical-link
+  case. Elasticities on a discrete variable raise.
 
 ## Difference-in-differences
 

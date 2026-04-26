@@ -102,6 +102,29 @@ def _central_jacobian(
 
 
 # ---------------------------------------------------------------------------
+# Marginal-effect method registry
+# ---------------------------------------------------------------------------
+#
+# ``method`` selects the per-observation transform applied to the raw
+# derivative dy/dx_i before averaging:
+#
+#   dydx : dy/dx_i                       (level change in y per unit x)
+#   dyex : dy/dx_i * x_i                 (semi-elasticity: dy / d(ln x))
+#   eyex : dy/dx_i * x_i / y_i           (full elasticity)
+#   eydx : dy/dx_i / y_i                 (semi-elasticity: d(ln y) / dx)
+#
+# Stat-name strings match Stata's ``margins`` and statsmodels'
+# ``get_margeff`` column headers.
+
+_METHOD_META = {
+    "dydx": {"prefix": "d", "stat_name": "dy/dx"},
+    "dyex": {"prefix": "d", "stat_name": "dy/ex"},
+    "eyex": {"prefix": "e", "stat_name": "ey/ex"},
+    "eydx": {"prefix": "e", "stat_name": "ey/dx"},
+}
+
+
+# ---------------------------------------------------------------------------
 # Results container
 # ---------------------------------------------------------------------------
 
@@ -595,6 +618,7 @@ class Margins:
         step: Optional[float] = None,
         reference: Optional[object] = None,
         factor_stat: str = "mean",
+        method: str = "dydx",
     ) -> MarginsResult:
         """Marginal effect of ``variable`` on the response.
 
@@ -615,6 +639,23 @@ class Margins:
             ``(eps**(1/3)) * max(std(x), 1)`` (central-difference sweet spot).
         reference : scalar, optional
             Reference level for discrete effects; defaults to the smallest.
+        method : {"dydx", "dyex", "eyex", "eydx"}, default ``"dydx"``
+            What to compute, per observation, before averaging:
+
+            - ``"dydx"`` : :math:`\\partial y_i / \\partial x_{ij}`
+              (level change). The default; only path with an analytic
+              outer Jacobian.
+            - ``"dyex"`` : :math:`(\\partial y_i / \\partial x_{ij})\\,x_i`
+              (semi-elasticity, :math:`dy/d(\\ln x)`).
+            - ``"eyex"`` : :math:`(\\partial y_i / \\partial x_{ij})\\,x_i / y_i`
+              (full elasticity).
+            - ``"eydx"`` : :math:`(\\partial y_i / \\partial x_{ij}) / y_i`
+              (semi-elasticity, :math:`d(\\ln y)/dx`).
+
+            Only valid for continuous variables; raises if the variable
+            is (auto- or explicitly) discrete and ``method != "dydx"``.
+            Elasticity methods always go through finite differences;
+            ``analytic=True`` on the constructor only affects ``"dydx"``.
 
         Returns
         -------
@@ -630,6 +671,10 @@ class Margins:
         MER (eff. at rep. values)     False        dict
         ============================  ===========  ==========
         """
+        if method not in _METHOD_META:
+            raise ValueError(
+                f"method must be one of {sorted(_METHOD_META)}, got {method!r}"
+            )
         self._check_factor_stat(factor_stat)
         col = self.data[variable]
 
@@ -641,6 +686,13 @@ class Margins:
                 discrete = True
             else:
                 discrete = False
+
+        if discrete and method != "dydx":
+            raise ValueError(
+                f"method={method!r} requires a continuous variable; "
+                f"got discrete=True for {variable!r}. "
+                f"Pass discrete=False to override."
+            )
 
         collapse = atmeans and factor_stat == "mean"
         if atmeans and factor_stat == "mode":
@@ -656,7 +708,7 @@ class Margins:
             )
         return self._dydx_continuous(
             variable, frames, at_labels, step=step, atmeans=atmeans,
-            collapse=collapse,
+            collapse=collapse, method=method,
         )
 
     # ----- continuous case (numerical derivative) ---------------------------
@@ -669,6 +721,7 @@ class Margins:
         step: Optional[float],
         atmeans: bool,
         collapse: bool = False,
+        method: str = "dydx",
     ) -> MarginsResult:
         if step is None:
             sd = float(self.data[variable].std(ddof=0))
@@ -676,46 +729,84 @@ class Margins:
             step = (np.finfo(float).eps ** (1.0 / 3.0)) * scale
         h = float(step)
 
-        Xs_plus, Xs_minus = [], []
+        # For ``eyex``/``eydx`` we need ``y_i = f(eta_i)`` evaluated at
+        # the *unperturbed* design row, so we keep an extra ``Xs_orig``.
+        # For ``dyex``/``eyex`` we need the original ``x_i`` values, in
+        # the same shape as Xp/Xm rows after any collapsing.
+        need_y = method in ("eyex", "eydx")
+        need_x = method in ("dyex", "eyex")
+
+        Xs_plus: List[np.ndarray] = []
+        Xs_minus: List[np.ndarray] = []
+        Xs_orig: List[np.ndarray] = []
+        x_vals: List[np.ndarray] = []
         for frame in frames:
+            x_col = np.asarray(frame[variable], dtype=float)
             f_plus = frame.copy()
             f_minus = frame.copy()
-            f_plus[variable] = f_plus[variable].astype(float) + h
-            f_minus[variable] = f_minus[variable].astype(float) - h
+            f_plus[variable] = x_col + h
+            f_minus[variable] = x_col - h
             Xp = self._build_exog(f_plus)
             Xm = self._build_exog(f_minus)
+            Xo = self._build_exog(frame) if need_y else None
             if collapse:
                 Xp = Xp.mean(axis=0, keepdims=True)
                 Xm = Xm.mean(axis=0, keepdims=True)
+                if Xo is not None:
+                    Xo = Xo.mean(axis=0, keepdims=True)
+                x_col = np.array([x_col.mean()])
             Xs_plus.append(Xp)
             Xs_minus.append(Xm)
+            if Xo is not None:
+                Xs_orig.append(Xo)
+            x_vals.append(x_col)
 
         def statistic(beta: np.ndarray) -> np.ndarray:
             out = np.empty(len(Xs_plus))
-            for i, (Xp, Xm) in enumerate(zip(Xs_plus, Xs_minus)):
-                out[i] = float(np.mean(
-                    (self._predict(beta, Xp) - self._predict(beta, Xm)) / (2.0 * h)
-                ))
+            for i in range(len(Xs_plus)):
+                Xp, Xm = Xs_plus[i], Xs_minus[i]
+                dydx_i = (self._predict(beta, Xp) - self._predict(beta, Xm)) / (2.0 * h)
+                if method == "dydx":
+                    contrib = dydx_i
+                elif method == "dyex":
+                    contrib = dydx_i * x_vals[i]
+                else:  # eyex / eydx
+                    y_i = self._predict(beta, Xs_orig[i])
+                    if method == "eyex":
+                        contrib = dydx_i * x_vals[i] / y_i
+                    else:  # eydx
+                        contrib = dydx_i / y_i
+                out[i] = float(np.mean(contrib))
             return out
 
-        fprime = self._link_deriv()
-        if fprime is not None:
-            def jac(beta: np.ndarray) -> np.ndarray:
-                J = np.empty((len(Xs_plus), beta.size))
-                for i, (Xp, Xm) in enumerate(zip(Xs_plus, Xs_minus)):
-                    gp = self._grad_mean_predict(Xp, beta, fprime)
-                    gm = self._grad_mean_predict(Xm, beta, fprime)
-                    J[i, :] = (gp - gm) / (2.0 * h)
-                return J
+        # Analytic Jacobian only for the level case ("dydx"); the three
+        # elasticities go through FD via _central_jacobian. Mixing FD
+        # for the inner ∂y/∂β with analytic for the elasticity scaling
+        # would require quotient-rule code with no numerical benefit
+        # over straight FD, so we keep the analytic path narrow.
+        if method == "dydx":
+            fprime = self._link_deriv()
+            if fprime is not None:
+                def jac(beta: np.ndarray) -> np.ndarray:
+                    J = np.empty((len(Xs_plus), beta.size))
+                    for i, (Xp, Xm) in enumerate(zip(Xs_plus, Xs_minus)):
+                        gp = self._grad_mean_predict(Xp, beta, fprime)
+                        gm = self._grad_mean_predict(Xm, beta, fprime)
+                        J[i, :] = (gp - gm) / (2.0 * h)
+                    return J
+            else:
+                jac = None
         else:
             jac = None
 
+        meta = _METHOD_META[method]
+        prefix, stat_name = meta["prefix"], meta["stat_name"]
         if len(frames) == 1 and at_labels[0] == "":
-            labels = [f"d{variable}" + (" (at means)" if atmeans else "")]
+            labels = [f"{prefix}{variable}" + (" (at means)" if atmeans else "")]
         else:
-            labels = [f"d{variable} | {lab}" if lab else f"d{variable}"
+            labels = [f"{prefix}{variable} | {lab}" if lab else f"{prefix}{variable}"
                       for lab in at_labels]
-        return self._delta(statistic, labels=labels, stat_name="dy/dx", jac=jac)
+        return self._delta(statistic, labels=labels, stat_name=stat_name, jac=jac)
 
     # ----- discrete case (contrast vs reference level) ---------------------
 
