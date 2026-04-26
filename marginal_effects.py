@@ -256,6 +256,12 @@ class Margins:
         Confidence level for intervals (default 0.95).
     use_t : bool
         If True and ``results.df_resid`` is available, use t-distribution.
+    analytic : bool
+        If True (default), use an analytic outer Jacobian
+        :math:`\\partial g/\\partial\\beta` whenever the model exposes a link
+        derivative (any GLM via ``family.link.inverse_deriv``, plus
+        ``OLS``/``WLS``/``GLS`` via the identity link). Falls back to central
+        finite differences otherwise. Set to False to force FD everywhere.
     """
 
     def __init__(
@@ -264,6 +270,7 @@ class Margins:
         data: Optional[pd.DataFrame] = None,
         level: float = 0.95,
         use_t: bool = False,
+        analytic: bool = True,
     ):
         self.results = results
         self.model = results.model
@@ -276,6 +283,7 @@ class Margins:
             )
         self.level = level
         self.df = getattr(results, "df_resid", None) if use_t else None
+        self.analytic = analytic
 
         if data is None:
             data = self._try_get_data()
@@ -345,6 +353,62 @@ class Margins:
                 return np.asarray(fam.link.inverse(eta))
             return eta
 
+    # ---- analytic outer-Jacobian support ----
+
+    def _link_deriv(self) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+        """Callable returning :math:`f'(\\eta)`, or ``None`` if FD is required.
+
+        Eligible when the model exposes ``family.link.inverse_deriv`` (every
+        stock GLM family) or is a linear-regression model (identity link).
+        Bails out — returning ``None`` so the caller falls back to FD —
+        whenever an offset or exposure is present, since then
+        :math:`\\eta \\neq X\\beta` and our chain rule would need an
+        offset-aware path we don't currently provide.
+        """
+        if not self.analytic:
+            return None
+        # Offset/exposure changes the linear-predictor formula.
+        off = getattr(self.model, "_offset_exposure", None)
+        if off is not None and np.any(np.asarray(off)):
+            return None
+        for attr in ("offset", "exposure"):
+            v = getattr(self.model, attr, None)
+            if v is not None and np.any(np.asarray(v)):
+                return None
+
+        fam = getattr(self.model, "family", None)
+        if fam is not None:
+            link = getattr(fam, "link", None)
+            if link is not None and callable(getattr(link, "inverse_deriv", None)):
+                return link.inverse_deriv
+            return None
+
+        try:
+            from statsmodels.regression.linear_model import RegressionModel
+        except ImportError:
+            return None
+        if isinstance(self.model, RegressionModel):
+            return lambda eta: np.ones_like(np.asarray(eta, dtype=float))
+        return None
+
+    @staticmethod
+    def _grad_mean_predict(
+        X: np.ndarray,
+        beta: np.ndarray,
+        fprime: Callable[[np.ndarray], np.ndarray],
+    ) -> np.ndarray:
+        """:math:`\\partial/\\partial\\beta` of :math:`(1/n)\\sum_i f(x_i^\\top\\beta)`.
+
+        Returns shape ``(p,)``. Building block for every analytic Jacobian
+        in this module: every statistic we compute is a linear combination
+        of mean-predictions on different design matrices, so each row of
+        the analytic ``J`` is a linear combination of these gradients.
+        """
+        X = np.asarray(X, dtype=float)
+        eta = X @ beta
+        fp = np.asarray(fprime(eta), dtype=float).ravel()
+        return (fp[:, None] * X).sum(axis=0) / X.shape[0]
+
     # ---- utilities for building "at" frames ----
 
     @staticmethod
@@ -410,14 +474,14 @@ class Margins:
         statistic: Callable[[np.ndarray], np.ndarray],
         labels: Sequence[str],
         stat_name: str,
+        jac: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ) -> MarginsResult:
         beta = self.params
         est = np.atleast_1d(np.asarray(statistic(beta), dtype=float)).ravel()
-        J = _central_jacobian(statistic, beta)
-        if est.size == 1:
-            J = np.atleast_2d(J)        # shape (1, p)
+        if jac is not None:
+            J = np.atleast_2d(np.asarray(jac(beta), dtype=float))
         else:
-            J = np.atleast_2d(J)        # shape (m, p)
+            J = np.atleast_2d(_central_jacobian(statistic, beta))
         V = J @ self.cov @ J.T
         return MarginsResult(
             estimate=est, vcov=V, labels=labels,
@@ -493,16 +557,30 @@ class Margins:
             labels = at_labels
             stat_name = "prediction"
 
+        Xs = []
+        for f in frames:
+            X = self._build_exog(f)
+            if collapse:
+                X = X.mean(axis=0, keepdims=True)
+            Xs.append(X)
+
         def statistic(beta: np.ndarray) -> np.ndarray:
-            out = np.empty(len(frames))
-            for i, f in enumerate(frames):
-                X = self._build_exog(f)
-                if collapse:
-                    X = X.mean(axis=0, keepdims=True)
+            out = np.empty(len(Xs))
+            for i, X in enumerate(Xs):
                 out[i] = float(np.mean(self._predict(beta, X)))
             return out
 
-        return self._delta(statistic, labels=labels, stat_name=stat_name)
+        fprime = self._link_deriv()
+        if fprime is not None:
+            def jac(beta: np.ndarray) -> np.ndarray:
+                J = np.empty((len(Xs), beta.size))
+                for i, X in enumerate(Xs):
+                    J[i, :] = self._grad_mean_predict(X, beta, fprime)
+                return J
+        else:
+            jac = None
+
+        return self._delta(statistic, labels=labels, stat_name=stat_name, jac=jac)
 
     # ======================================================================
     # Public API: marginal effects
@@ -598,33 +676,46 @@ class Margins:
             step = (np.finfo(float).eps ** (1.0 / 3.0)) * scale
         h = float(step)
 
-        def make_one(frame: pd.DataFrame) -> Callable[[np.ndarray], float]:
-            def s(beta: np.ndarray) -> float:
-                f_plus = frame.copy()
-                f_minus = frame.copy()
-                f_plus[variable] = f_plus[variable].astype(float) + h
-                f_minus[variable] = f_minus[variable].astype(float) - h
-                Xp = self._build_exog(f_plus)
-                Xm = self._build_exog(f_minus)
-                if collapse:
-                    Xp = Xp.mean(axis=0, keepdims=True)
-                    Xm = Xm.mean(axis=0, keepdims=True)
-                return float(np.mean(
-                    (self._predict(beta, Xp) - self._predict(beta, Xm)) / (2.0 * h)
-                ))
-            return s
-
-        stat_fns = [make_one(f) for f in frames]
+        Xs_plus, Xs_minus = [], []
+        for frame in frames:
+            f_plus = frame.copy()
+            f_minus = frame.copy()
+            f_plus[variable] = f_plus[variable].astype(float) + h
+            f_minus[variable] = f_minus[variable].astype(float) - h
+            Xp = self._build_exog(f_plus)
+            Xm = self._build_exog(f_minus)
+            if collapse:
+                Xp = Xp.mean(axis=0, keepdims=True)
+                Xm = Xm.mean(axis=0, keepdims=True)
+            Xs_plus.append(Xp)
+            Xs_minus.append(Xm)
 
         def statistic(beta: np.ndarray) -> np.ndarray:
-            return np.array([s(beta) for s in stat_fns], dtype=float)
+            out = np.empty(len(Xs_plus))
+            for i, (Xp, Xm) in enumerate(zip(Xs_plus, Xs_minus)):
+                out[i] = float(np.mean(
+                    (self._predict(beta, Xp) - self._predict(beta, Xm)) / (2.0 * h)
+                ))
+            return out
+
+        fprime = self._link_deriv()
+        if fprime is not None:
+            def jac(beta: np.ndarray) -> np.ndarray:
+                J = np.empty((len(Xs_plus), beta.size))
+                for i, (Xp, Xm) in enumerate(zip(Xs_plus, Xs_minus)):
+                    gp = self._grad_mean_predict(Xp, beta, fprime)
+                    gm = self._grad_mean_predict(Xm, beta, fprime)
+                    J[i, :] = (gp - gm) / (2.0 * h)
+                return J
+        else:
+            jac = None
 
         if len(frames) == 1 and at_labels[0] == "":
             labels = [f"d{variable}" + (" (at means)" if atmeans else "")]
         else:
             labels = [f"d{variable} | {lab}" if lab else f"d{variable}"
                       for lab in at_labels]
-        return self._delta(statistic, labels=labels, stat_name="dy/dx")
+        return self._delta(statistic, labels=labels, stat_name="dy/dx", jac=jac)
 
     # ----- discrete case (contrast vs reference level) ---------------------
 
@@ -647,31 +738,44 @@ class Margins:
             reference = levels[0]
         others = [lv for lv in levels if lv != reference]
 
-        def make_one(frame: pd.DataFrame, lvl) -> Callable[[np.ndarray], float]:
-            def s(beta: np.ndarray) -> float:
-                f_ref = frame.copy(); f_ref[variable] = reference
-                f_lvl = frame.copy(); f_lvl[variable] = lvl
-                Xr = self._build_exog(f_ref)
-                Xl = self._build_exog(f_lvl)
-                if collapse:
-                    Xr = Xr.mean(axis=0, keepdims=True)
-                    Xl = Xl.mean(axis=0, keepdims=True)
-                return float(np.mean(self._predict(beta, Xl))
-                             - np.mean(self._predict(beta, Xr)))
-            return s
-
-        stat_fns: List[Callable[[np.ndarray], float]] = []
+        Xs_lvl: List[np.ndarray] = []
+        Xs_ref: List[np.ndarray] = []
         labels: List[str] = []
         for frame, at_lab in zip(frames, at_labels):
+            f_ref = frame.copy(); f_ref[variable] = reference
+            Xref = self._build_exog(f_ref)
+            if collapse:
+                Xref = Xref.mean(axis=0, keepdims=True)
             for lvl in others:
-                stat_fns.append(make_one(frame, lvl))
+                f_lvl = frame.copy(); f_lvl[variable] = lvl
+                Xl = self._build_exog(f_lvl)
+                if collapse:
+                    Xl = Xl.mean(axis=0, keepdims=True)
+                Xs_lvl.append(Xl)
+                Xs_ref.append(Xref)
                 base = f"{variable}: {lvl} vs {reference}"
                 labels.append(f"{base} | {at_lab}" if at_lab else base)
 
         def statistic(beta: np.ndarray) -> np.ndarray:
-            return np.array([s(beta) for s in stat_fns], dtype=float)
+            out = np.empty(len(Xs_lvl))
+            for i, (Xl, Xr) in enumerate(zip(Xs_lvl, Xs_ref)):
+                out[i] = float(np.mean(self._predict(beta, Xl))
+                               - np.mean(self._predict(beta, Xr)))
+            return out
 
-        return self._delta(statistic, labels=labels, stat_name="contrast")
+        fprime = self._link_deriv()
+        if fprime is not None:
+            def jac(beta: np.ndarray) -> np.ndarray:
+                J = np.empty((len(Xs_lvl), beta.size))
+                for i, (Xl, Xr) in enumerate(zip(Xs_lvl, Xs_ref)):
+                    gl = self._grad_mean_predict(Xl, beta, fprime)
+                    gr = self._grad_mean_predict(Xr, beta, fprime)
+                    J[i, :] = gl - gr
+                return J
+        else:
+            jac = None
+
+        return self._delta(statistic, labels=labels, stat_name="contrast", jac=jac)
 
     # ======================================================================
     # Public API: difference-in-differences

@@ -209,6 +209,69 @@ hand_aap_se = np.sqrt(g @ V @ g)
 print(f"AAP SE (hand): {hand_aap_se:.8f}")
 assert np.isclose(aap.se[0], hand_aap_se, rtol=1e-5)
 
+# ---------------------------------------------------------------------------
+# 6. Analytic vs FD parity — every public API call should give the same
+#    answer through the analytic fast path and through the FD fallback,
+#    to FD's tolerance.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 72)
+print("TEST 5 : analytic vs FD parity (Margins(analytic=True/False))")
+print("=" * 72)
+
+def _close(a, b, *, atol=1e-7, rtol=1e-5):
+    a = np.atleast_1d(np.asarray(a, dtype=float))
+    b = np.atleast_1d(np.asarray(b, dtype=float))
+    return np.allclose(a, b, atol=atol, rtol=rtol)
+
+cases = [
+    ("OLS poly+inter", ols, [
+        ("AAP",                 lambda M: M.predict()),
+        ("APM",                 lambda M: M.predict(atmeans=True)),
+        ("APR x1=[-1,0,1]",     lambda M: M.predict(at={"x1": [-1.0, 0.0, 1.0]})),
+        ("AME x1",              lambda M: M.dydx("x1")),
+        ("MEM x1",              lambda M: M.dydx("x1", atmeans=True)),
+        ("MER x1 | x2={-1,1}",  lambda M: M.dydx("x1", at={"x2": [-1.0, 1.0]})),
+    ]),
+    ("Logit + C(grp)", logit, [
+        ("AAP",            lambda M: M.predict()),
+        ("APM",            lambda M: M.predict(atmeans=True)),
+        ("AME x1",         lambda M: M.dydx("x1")),
+        ("MEM x1",         lambda M: M.dydx("x1", atmeans=True)),
+        ("MEM x1 (mode)",  lambda M: M.dydx("x1", atmeans=True, factor_stat="mode")),
+        ("AME grp",        lambda M: M.dydx("grp")),
+    ]),
+    ("Poisson", pois, [
+        ("AAP",     lambda M: M.predict()),
+        ("APM",     lambda M: M.predict(atmeans=True)),
+        ("AME x1",  lambda M: M.dydx("x1")),
+        ("MEM x1",  lambda M: M.dydx("x1", atmeans=True)),
+    ]),
+]
+
+for model_name, fit, calls in cases:
+    M_an = Margins(fit, analytic=True)
+    M_fd = Margins(fit, analytic=False)
+    for label, call in calls:
+        r_an = call(M_an)
+        r_fd = call(M_fd)
+        assert _close(r_an.estimate, r_fd.estimate), (
+            f"{model_name} :: {label}: estimate mismatch "
+            f"analytic={r_an.estimate} fd={r_fd.estimate}"
+        )
+        assert _close(r_an.se, r_fd.se), (
+            f"{model_name} :: {label}: SE mismatch "
+            f"analytic={r_an.se} fd={r_fd.se}"
+        )
+        print(f"  {model_name:18s} {label:24s} OK")
+
+# And the eligibility plumbing itself: OLS / Logit / Poisson should all
+# go through the analytic path, and analytic=False should disable it.
+assert Margins(ols)._link_deriv() is not None
+assert Margins(logit)._link_deriv() is not None
+assert Margins(pois)._link_deriv() is not None
+assert Margins(ols, analytic=False)._link_deriv() is None
+
 print("\n" + "=" * 72)
 print("ALL TESTS PASSED")
 print("=" * 72)
