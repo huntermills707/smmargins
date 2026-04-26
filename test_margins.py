@@ -69,7 +69,7 @@ print()
 print("-" * 72)
 print("APR: predict at x1 in {-1, 0, 1}, averaging over x2 as observed")
 print("-" * 72)
-apr = M.predict(at={"x1": [-1.0, 0.0, 1.0]})
+apr = M.predict(atexog={"x1": [-1.0, 0.0, 1.0]})
 print(apr)
 
 # Hand compute first row: predict at x1=-1, x2=x2_i, average.
@@ -124,7 +124,7 @@ assert np.isclose(ame.se[0], sm_x1_se, rtol=1e-3)
 
 # MEM: evaluate at means.  Default factor_stat="mean" matches Stata /
 # statsmodels: design-matrix means (i.e. observed proportions for dummies).
-mem_x1 = ML.dydx("x1", atmeans=True)
+mem_x1 = ML.dydx("x1", at="mean")
 mfx_mean = logit.get_margeff(at="mean", method="dydx")
 sm_x1_mem = mfx_mean.margeff[x1_pos]
 sm_x1_mem_se = mfx_mean.margeff_se[x1_pos]
@@ -137,7 +137,7 @@ assert np.isclose(mem_x1.se[0], sm_x1_mem_se, rtol=1e-3)
 # old behavior and should differ from statsmodels whenever a non-modal
 # factor level has nontrivial proportion. Sanity-check it against a hand
 # computation on the modal factor row.
-mem_x1_mode = ML.dydx("x1", atmeans=True, factor_stat="mode")
+mem_x1_mode = ML.dydx("x1", at="mean", factor_stat="mode")
 modal_grp = df["grp"].mode().iloc[0]
 row = pd.DataFrame([{
     "x1": df["x1"].mean(), "x2": df["x2"].mean(),
@@ -227,25 +227,25 @@ def _close(a, b, *, atol=1e-7, rtol=1e-5):
 cases = [
     ("OLS poly+inter", ols, [
         ("AAP",                 lambda M: M.predict()),
-        ("APM",                 lambda M: M.predict(atmeans=True)),
-        ("APR x1=[-1,0,1]",     lambda M: M.predict(at={"x1": [-1.0, 0.0, 1.0]})),
+        ("APM",                 lambda M: M.predict(at="mean")),
+        ("APR x1=[-1,0,1]",     lambda M: M.predict(atexog={"x1": [-1.0, 0.0, 1.0]})),
         ("AME x1",              lambda M: M.dydx("x1")),
-        ("MEM x1",              lambda M: M.dydx("x1", atmeans=True)),
-        ("MER x1 | x2={-1,1}",  lambda M: M.dydx("x1", at={"x2": [-1.0, 1.0]})),
+        ("MEM x1",              lambda M: M.dydx("x1", at="mean")),
+        ("MER x1 | x2={-1,1}",  lambda M: M.dydx("x1", atexog={"x2": [-1.0, 1.0]})),
     ]),
     ("Logit + C(grp)", logit, [
         ("AAP",            lambda M: M.predict()),
-        ("APM",            lambda M: M.predict(atmeans=True)),
+        ("APM",            lambda M: M.predict(at="mean")),
         ("AME x1",         lambda M: M.dydx("x1")),
-        ("MEM x1",         lambda M: M.dydx("x1", atmeans=True)),
-        ("MEM x1 (mode)",  lambda M: M.dydx("x1", atmeans=True, factor_stat="mode")),
+        ("MEM x1",         lambda M: M.dydx("x1", at="mean")),
+        ("MEM x1 (mode)",  lambda M: M.dydx("x1", at="mean", factor_stat="mode")),
         ("AME grp",        lambda M: M.dydx("grp")),
     ]),
     ("Poisson", pois, [
         ("AAP",     lambda M: M.predict()),
-        ("APM",     lambda M: M.predict(atmeans=True)),
+        ("APM",     lambda M: M.predict(at="mean")),
         ("AME x1",  lambda M: M.dydx("x1")),
-        ("MEM x1",  lambda M: M.dydx("x1", atmeans=True)),
+        ("MEM x1",  lambda M: M.dydx("x1", at="mean")),
     ]),
 ]
 
@@ -298,7 +298,7 @@ for elas in ("eyex", "dyex", "eydx"):
     assert np.isclose(ours_ame.se[0], sm_se, rtol=1e-3), (
         f"{elas} AME SE mismatch")
 
-    ours_mem = ML.dydx("x1", atmeans=True, method=elas)
+    ours_mem = ML.dydx("x1", at="mean", method=elas)
     sm_mem = logit.get_margeff(at="mean", method=elas)
     sm_e_m = sm_mem.margeff[x1_pos]
     sm_se_m = sm_mem.margeff_se[x1_pos]
@@ -324,7 +324,7 @@ for elas in ("eyex", "dyex", "eydx"):
 # Stata-style sanity: for Poisson with canonical link, eyex(x_j) =
 # beta_j * mean(x_j) when evaluated at means. This isn't exactly what
 # AME-eyex is (it averages eyex_i, not eyex at means), so we use MEM:
-mem_eyex = MP.dydx("x1", atmeans=True, method="eyex")
+mem_eyex = MP.dydx("x1", at="mean", method="eyex")
 hand_eyex_mem = pois.params["x1"] * df["x1"].mean()
 print(f"\n  Pois   MEM eyex (x1):  ours={mem_eyex.estimate[0]:+.6f}  "
       f"hand=β1·mean(x1)={hand_eyex_mem:+.6f}")

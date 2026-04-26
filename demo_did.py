@@ -136,7 +136,7 @@ print("=" * 84)
 did_profile = M.did(
     "group", "preexist_Y",
     group_levels=["A", "B"], condition_levels=[0, 1],
-    at={"age": 60, "female": 0},
+    atexog={"age": 60, "female": 0},
 )
 print(did_profile.did)
 

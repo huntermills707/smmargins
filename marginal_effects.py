@@ -462,69 +462,116 @@ class Margins:
             labels.append(", ".join(f"{k}={val}" for k, val in zip(keys, combo)))
         return frames, labels
 
-    def _means_row(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """One-row frame: mean for numeric columns, mode for the rest.
+    def _single_row(self, at: str, factor_stat: str) -> pd.DataFrame:
+        """Build a one-row representative frame in data space.
 
-        Used when ``factor_stat="mode"`` — gives a "modal typical
-        individual" rather than a fictional fractional one. The default
-        ``factor_stat="mean"`` path bypasses this and instead averages
-        the design matrix directly (matching Stata's ``margins, atmeans``
-        and statsmodels' ``get_margeff(at='mean')``).
+        Numeric columns get the value implied by ``at``
+        (mean / median / 0). Factor / categorical columns get the value
+        implied by ``factor_stat`` (modal level for ``"mode"``, first
+        observed level for ``"zero"``).
+
+        ``factor_stat="mean"`` is not handled here — the caller routes
+        that through a design-matrix-collapse path so that factor dummies
+        end up at their observed proportions, which has no representation
+        in data space.
         """
         row = {}
-        for c in frame.columns:
-            col = frame[c]
-            if pd.api.types.is_numeric_dtype(col) and not pd.api.types.is_bool_dtype(col):
-                row[c] = col.mean()
-            else:
+        for c in self.data.columns:
+            col = self.data[c]
+            is_numeric = (
+                pd.api.types.is_numeric_dtype(col)
+                and not pd.api.types.is_bool_dtype(col)
+            )
+            if is_numeric:
+                if at == "mean":
+                    row[c] = col.mean()
+                elif at == "median":
+                    row[c] = col.median()
+                elif at == "zero":
+                    row[c] = 0.0
+                else:
+                    raise ValueError(
+                        f"_single_row called with at={at!r}; only "
+                        f"'mean'/'median'/'zero' are valid here."
+                    )
+            elif factor_stat == "mode":
                 try:
                     row[c] = col.mode().iloc[0]
                 except Exception:
                     row[c] = col.iloc[0]
-        return pd.DataFrame([row])
-
-    def _median_row(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """One-row frame: median for numeric columns, mode for the rest.
-
-        Matches ``get_margeff(at='median')``: evaluate at the column-wise
-        median of each covariate, with factors held at their modal level.
-        """
-        row = {}
-        for c in frame.columns:
-            col = frame[c]
-            if pd.api.types.is_numeric_dtype(col) and not pd.api.types.is_bool_dtype(col):
-                row[c] = col.median()
-            else:
-                try:
-                    row[c] = col.mode().iloc[0]
-                except Exception:
-                    row[c] = col.iloc[0]
-        return pd.DataFrame([row])
-
-    def _zero_row(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """One-row frame: numeric columns at zero, factors at first observed level.
-
-        Matches ``get_margeff(at='zero')``.
-        """
-        row = {}
-        for c in frame.columns:
-            col = frame[c]
-            if pd.api.types.is_numeric_dtype(col) and not pd.api.types.is_bool_dtype(col):
-                row[c] = 0.0
-            else:
+            elif factor_stat == "zero":
                 try:
                     row[c] = sorted(col.dropna().unique())[0]
                 except TypeError:
                     row[c] = col.iloc[0]
+            else:
+                raise ValueError(
+                    f"_single_row called with factor_stat={factor_stat!r}; "
+                    f"the 'mean' path uses design-matrix collapse instead."
+                )
         return pd.DataFrame([row])
+
+    def _resolve_base(self, at: str, factor_stat: str) -> tuple[pd.DataFrame, bool]:
+        """Return ``(base_frame, collapse)``.
+
+        ``collapse=True`` means the caller should apply
+        ``X.mean(axis=0, keepdims=True)`` to the design matrix after
+        building it — this is how factor dummies become their observed
+        proportions (Stata's ``atmeans`` semantics).
+
+        ``collapse=False`` means ``base_frame`` is already a single
+        representative row, with both numeric and factor columns
+        materialized in data space.
+        """
+        if at == "overall":
+            return self.data, False
+
+        if factor_stat == "mean":
+            # Modify numerics in data space; leave factors observed and
+            # let X.mean later pick up their proportions.
+            f = self.data.copy()
+            for c in f.columns:
+                col = f[c]
+                is_numeric = (
+                    pd.api.types.is_numeric_dtype(col)
+                    and not pd.api.types.is_bool_dtype(col)
+                )
+                if not is_numeric:
+                    continue
+                if at == "median":
+                    f[c] = col.median()
+                elif at == "zero":
+                    f[c] = 0.0
+                # at == "mean": X.mean handles it without touching the data.
+            return f, True
+
+        return self._single_row(at, factor_stat), False
+
+    @staticmethod
+    def _check_at(at: str) -> None:
+        if at not in ("overall", "mean", "median", "zero"):
+            raise ValueError(
+                f"at must be 'overall', 'mean', 'median', or 'zero', "
+                f"got {at!r}"
+            )
 
     @staticmethod
     def _check_factor_stat(factor_stat: str) -> None:
-        if factor_stat not in ("mean", "mode", "median", "zero"):
+        if factor_stat not in ("mean", "mode", "zero"):
             raise ValueError(
-                f"factor_stat must be 'mean', 'mode', 'median', or 'zero', "
+                f"factor_stat must be 'mean', 'mode', or 'zero', "
                 f"got {factor_stat!r}"
             )
+
+    @staticmethod
+    def _default_factor_stat(at: str) -> str:
+        """Pick a sensible factor_stat when the user didn't supply one."""
+        return {
+            "overall": "mean",  # ignored — no collapse happens
+            "mean":    "mean",  # Stata default: design-matrix proportions
+            "median":  "mode",  # median is undefined for categoricals
+            "zero":    "zero",  # reference level — matches at='zero' semantics
+        }[at]
 
     # ---- the delta-method worker ----
 
@@ -553,40 +600,50 @@ class Margins:
 
     def predict(
         self,
-        at: Optional[Mapping[str, object]] = None,
-        atmeans: bool = False,
-        factor_stat: str = "mean",
+        at: str = "overall",
+        atexog: Optional[Mapping[str, object]] = None,
+        factor_stat: Optional[str] = None,
     ) -> MarginsResult:
         """Adjusted predictions (expected outcome on the response scale).
 
         Parameters
         ----------
-        at : mapping, optional
-            Variable name -> scalar or list. Each variable is held fixed at
-            the given value(s); all others are left at their observed values
-            (unless ``atmeans=True``, in which case others go to their means).
-            Lists are expanded as a cartesian product.
-        atmeans : bool
-            If True, compute at the means of all variables (modified by
-            any ``at=`` overrides) rather than averaging over the sample.
-        factor_stat : {"mean", "mode", "median", "zero"}, default "mean"
-            How to summarize covariates when ``atmeans=True``.
+        at : {"overall", "mean", "median", "zero"}, default "overall"
+            Profile at which to evaluate. Mirrors statsmodels'
+            ``get_margeff(at=...)``.
 
-            - ``"mean"`` (default): average the *design matrix* (so each
-              dummy column gets its observed proportion). Matches Stata's
-              ``margins, atmeans`` and statsmodels'
-              ``get_margeff(at='mean')``.
+            - ``"overall"`` (default): average over the data — Average
+              Adjusted Prediction (AAP).
+            - ``"mean"``: evaluate at the mean of each covariate. With
+              ``factor_stat="mean"`` (the default for this case), this
+              collapses the design matrix column-wise so factor dummies
+              become their observed proportions — Stata's
+              ``margins, atmeans`` and statsmodels' ``get_margeff(at='mean')``.
             - ``"median"``: evaluate at the column-wise median of each
-              numeric covariate (mode for factors). Matches
-              ``get_margeff(at='median')``.
-            - ``"zero"``: evaluate at zero for all numeric covariates
-              (first observed level for factors). Matches
-              ``get_margeff(at='zero')``.
-            - ``"mode"``: numeric columns at their mean, factors at their
-              modal level — a "typical individual" rather than a fictional
-              fractional one.
+              numeric covariate. Factors default to their modal level.
+            - ``"zero"``: evaluate at zero for all numeric covariates.
+              Factors default to their reference (first observed) level —
+              matching statsmodels' ``get_margeff(at='zero')``.
+        atexog : mapping, optional
+            Variable name -> scalar or list. Each variable is held fixed
+            at the given value(s); all others go to their ``at``-determined
+            values. Lists are expanded as a cartesian product. Same role
+            as statsmodels' ``atexog`` (but keyed by name, not column
+            index — strictly an upgrade in UX).
+        factor_stat : {"mean", "mode", "zero"}, optional
+            How factors are handled when ``at != "overall"``. If ``None``
+            (default), chosen by ``at``: ``"mean"`` for ``at="mean"``,
+            ``"mode"`` for ``at="median"``, ``"zero"`` for ``at="zero"``.
 
-            Ignored when ``atmeans=False``.
+            - ``"mean"``: factors become their observed proportions
+              (design-matrix collapse). The Stata default. Only fully
+              meaningful with ``at="mean"`` but also defined for
+              ``"median"``/``"zero"`` (numerics held at the requested
+              point, factors at observed proportions).
+            - ``"mode"``: factors at their modal level — a "typical
+              individual" rather than a fictional fractional one.
+            - ``"zero"``: factors at their reference (first observed)
+              level.
 
         Returns
         -------
@@ -594,36 +651,33 @@ class Margins:
 
         Notes
         -----
-        ============================  ===========  ==========
-        Statistic                     ``atmeans``  ``at``
-        ============================  ===========  ==========
-        AAP  (avg adj. prediction)    False        None
-        APM  (pred. at means)         True         None
-        APR  (pred. at rep. values)   False        dict  (avg over others)
-        APM + at                      True         dict  (others at means)
-        ============================  ===========  ==========
+        ============================  ============================================
+        Statistic                     Call
+        ============================  ============================================
+        AAP  (avg adj. prediction)    ``predict()``
+        APM  (pred. at means)         ``predict(at="mean")``
+        APR  (pred. at rep. values)   ``predict(atexog={"x1": [0,1,2]})``
+        APR with others at means      ``predict(at="mean", atexog={"x1": [0,1,2]})``
+        ============================  ============================================
         """
+        self._check_at(at)
+        if factor_stat is None:
+            factor_stat = self._default_factor_stat(at)
         self._check_factor_stat(factor_stat)
-        collapse = atmeans and factor_stat == "mean"
-        if atmeans and factor_stat == "mode":
-            base = self._means_row(self.data)
-        elif atmeans and factor_stat == "median":
-            base = self._median_row(self.data)
-        elif atmeans and factor_stat == "zero":
-            base = self._zero_row(self.data)
-        else:
-            base = self.data
-        frames, at_labels = self._expand_at(base, at)
 
-        if at is None and not atmeans:
-            labels = ["AAP"]
-            stat_name = "prediction"
-        elif at is None and atmeans:
-            labels = ["APM"]
-            stat_name = "prediction"
+        base, collapse = self._resolve_base(at, factor_stat)
+        frames, at_labels = self._expand_at(base, atexog)
+
+        stat_name = "prediction"
+        if atexog is None:
+            if at == "overall":
+                labels = ["AAP"]
+            elif at == "mean":
+                labels = ["APM"]
+            else:
+                labels = [f"AP @ {at}"]
         else:
             labels = at_labels
-            stat_name = "prediction"
 
         Xs = []
         for f in frames:
@@ -657,12 +711,12 @@ class Margins:
     def dydx(
         self,
         variable: str,
-        at: Optional[Mapping[str, object]] = None,
-        atmeans: bool = False,
+        at: str = "overall",
+        atexog: Optional[Mapping[str, object]] = None,
         discrete: Optional[bool] = None,
         step: Optional[float] = None,
         reference: Optional[object] = None,
-        factor_stat: str = "mean",
+        factor_stat: Optional[str] = None,
         method: str = "dydx",
     ) -> MarginsResult:
         """Marginal effect of ``variable`` on the response.
@@ -671,7 +725,7 @@ class Margins:
         ----------
         variable : str
             Column name in the fitting data frame.
-        at, atmeans, factor_stat : see :meth:`predict`.
+        at, atexog, factor_stat : see :meth:`predict`.
         discrete : bool, optional
             If True, use discrete changes (level vs reference).
             If False, use a numerical derivative.
@@ -708,19 +762,25 @@ class Margins:
 
         Notes
         -----
-        ============================  ===========  ==========
-        Statistic                     ``atmeans``  ``at``
-        ============================  ===========  ==========
-        AME (average marginal eff.)   False        None
-        MEM (marginal eff. at means)  True         None
-        MER (eff. at rep. values)     False        dict
-        ============================  ===========  ==========
+        ============================  =====================================
+        Statistic                     Call
+        ============================  =====================================
+        AME (average marginal eff.)   ``dydx("x1")``
+        MEM (marginal eff. at means)  ``dydx("x1", at="mean")``
+        MER (eff. at rep. values)     ``dydx("x1", atexog={"x2": [0, 1]})``
+        At medians                    ``dydx("x1", at="median")``
+        At zero                       ``dydx("x1", at="zero")``
+        ============================  =====================================
         """
         if method not in _METHOD_META:
             raise ValueError(
                 f"method must be one of {sorted(_METHOD_META)}, got {method!r}"
             )
+        self._check_at(at)
+        if factor_stat is None:
+            factor_stat = self._default_factor_stat(at)
         self._check_factor_stat(factor_stat)
+
         col = self.data[variable]
 
         if discrete is None:
@@ -739,16 +799,8 @@ class Margins:
                 f"Pass discrete=False to override."
             )
 
-        collapse = atmeans and factor_stat == "mean"
-        if atmeans and factor_stat == "mode":
-            base = self._means_row(self.data)
-        elif atmeans and factor_stat == "median":
-            base = self._median_row(self.data)
-        elif atmeans and factor_stat == "zero":
-            base = self._zero_row(self.data)
-        else:
-            base = self.data
-        frames, at_labels = self._expand_at(base, at)
+        base, collapse = self._resolve_base(at, factor_stat)
+        frames, at_labels = self._expand_at(base, atexog)
 
         if discrete:
             return self._dydx_discrete(
@@ -756,7 +808,7 @@ class Margins:
                 collapse=collapse,
             )
         return self._dydx_continuous(
-            variable, frames, at_labels, step=step, atmeans=atmeans,
+            variable, frames, at_labels, step=step, at=at,
             collapse=collapse, method=method,
         )
 
@@ -768,7 +820,7 @@ class Margins:
         frames: List[pd.DataFrame],
         at_labels: List[str],
         step: Optional[float],
-        atmeans: bool,
+        at: str,
         collapse: bool = False,
         method: str = "dydx",
     ) -> MarginsResult:
@@ -850,8 +902,14 @@ class Margins:
 
         meta = _METHOD_META[method]
         prefix, stat_name = meta["prefix"], meta["stat_name"]
+        suffix_map = {
+            "overall": "",
+            "mean":    " (at means)",
+            "median":  " (at medians)",
+            "zero":    " (at zero)",
+        }
         if len(frames) == 1 and at_labels[0] == "":
-            labels = [f"{prefix}{variable}" + (" (at means)" if atmeans else "")]
+            labels = [f"{prefix}{variable}{suffix_map[at]}"]
         else:
             labels = [f"{prefix}{variable} | {lab}" if lab else f"{prefix}{variable}"
                       for lab in at_labels]
@@ -927,17 +985,17 @@ class Margins:
         condition: str,
         group_levels: Optional[Sequence] = None,
         condition_levels: Optional[Sequence] = None,
-        at: Optional[Mapping[str, object]] = None,
-        atmeans: bool = False,
-        factor_stat: str = "mean",
+        at: str = "overall",
+        atexog: Optional[Mapping[str, object]] = None,
+        factor_stat: Optional[str] = None,
     ) -> "DiDResult":
         """Difference-in-differences on the response scale.
 
         Sets up a 2×2 grid (``group`` × ``condition``), computes adjusted
         predictions for all four cells (averaging over other covariates
-        unless ``atmeans`` / ``at`` overrides them), and returns the cell
-        means, both simple effects, and the DiD — all sharing the same
-        delta-method joint covariance.
+        per ``at`` / ``atexog``), and returns the cell means, both simple
+        effects, and the DiD — all sharing the same delta-method joint
+        covariance.
 
         Parameters
         ----------
@@ -948,12 +1006,7 @@ class Margins:
         group_levels, condition_levels : sequence of length 2, optional
             Which two levels to use (reference first, treated second).
             Default: the two smallest observed levels.
-        at : dict, optional
-            Extra covariates to fix (see :meth:`predict`).
-        atmeans : bool
-            If True, evaluate at means of everything else.
-        factor_stat : {"mean", "mode"}, default "mean"
-            See :meth:`predict`.
+        at, atexog, factor_stat : see :meth:`predict`.
 
         Returns
         -------
@@ -978,12 +1031,12 @@ class Margins:
         if len(g) != 2 or len(c) != 2:
             raise ValueError("DiD requires exactly 2 levels for each factor.")
 
-        at_full = dict(at) if at else {}
+        atexog_full = dict(atexog) if atexog else {}
         # Insert group first, condition second -> itertools.product iterates
         # with condition varying fastest: (g0,c0),(g0,c1),(g1,c0),(g1,c1)
-        at_full[group] = g
-        at_full[condition] = c
-        cells = self.predict(at=at_full, atmeans=atmeans, factor_stat=factor_stat)
+        atexog_full[group] = g
+        atexog_full[condition] = c
+        cells = self.predict(at=at, atexog=atexog_full, factor_stat=factor_stat)
 
         # Rewrite the cell labels to the compact "(group=A, condition=0)" form
         cells.labels = [

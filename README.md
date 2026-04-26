@@ -74,28 +74,38 @@ from marginal_effects import Margins
 M = Margins(fit)                 # fit is a statsmodels results object
 
 # --- adjusted predictions ---
-M.predict()                      # AAP
-M.predict(atmeans=True)          # APM
-M.predict(at={"x1": [0, 1, 2]})  # APR (table; others at observed values)
-M.predict(at={"x1": [0, 1, 2]}, atmeans=True)  # APR holding others at means
+M.predict()                                       # AAP             (at="overall")
+M.predict(at="mean")                              # APM             (at="mean")
+M.predict(at="median")                            # APM at medians
+M.predict(at="zero")                              # APM at zero
+M.predict(atexog={"x1": [0, 1, 2]})               # APR (others at observed values)
+M.predict(atexog={"x1": [0, 1, 2]}, at="mean")    # APR holding others at means
 
 # --- marginal effects ---
-M.dydx("x1")                     # AME (continuous auto-detected)
-M.dydx("x1", atmeans=True)       # MEM (Stata-style: factors at proportions)
-M.dydx("x1", at={"x2": [0, 1]})  # MER
-M.dydx("group")                  # discrete contrasts vs reference level
-M.dydx("group", reference="b")   # discrete contrasts vs "b"
+M.dydx("x1")                                      # AME (continuous auto-detected)
+M.dydx("x1", at="mean")                           # MEM (factors at proportions)
+M.dydx("x1", at="median")                         # ME at medians
+M.dydx("x1", atexog={"x2": [0, 1]})               # MER
+M.dydx("group")                                   # discrete contrasts vs reference level
+M.dydx("group", reference="b")                    # discrete contrasts vs "b"
 
 # --- elasticities (continuous only) ---
-M.dydx("x1", method="eyex")      # full elasticity:    ey/ex = (dy/dx)·x/y
-M.dydx("x1", method="dyex")      # semi-elasticity:    dy/ex = (dy/dx)·x
-M.dydx("x1", method="eydx")      # semi-elasticity:    ey/dx = (dy/dx)/y
-# Combine with atmeans/at as usual; raises on discrete variables.
+M.dydx("x1", method="eyex")                       # full elasticity:    ey/ex = (dy/dx)·x/y
+M.dydx("x1", method="dyex")                       # semi-elasticity:    dy/ex = (dy/dx)·x
+M.dydx("x1", method="eydx")                       # semi-elasticity:    ey/dx = (dy/dx)/y
+# Combine with at=/atexog= as usual; raises on discrete variables.
 
-# --- atmeans: Stata-style by default, mode opt-in ---
-M.predict(atmeans=True)                       # factor dummies at observed proportions
-M.predict(atmeans=True, factor_stat="mode")   # factors held at modal level instead
+# --- factor handling at evaluation points ---
+M.predict(at="mean")                              # factor dummies at observed proportions (Stata default)
+M.predict(at="mean", factor_stat="mode")          # factors held at modal level
+M.predict(at="zero", factor_stat="mode")          # numerics at 0, factors at mode
 ```
+
+The `at=` parameter mirrors statsmodels' `get_margeff(at=...)`:
+`"overall"` (default), `"mean"`, `"median"`, `"zero"`. The `atexog=` dict
+fixes specific variables at specific values (Stata's `margins, at(...)`);
+unlike statsmodels' `atexog`, it's keyed by **variable name** rather than
+column index.
 
 Each call returns a `MarginsResult` with `.estimate`, `.se`, `.vcov`,
 `.ci_lower`, `.ci_upper`, `.pvalue`, plus `.summary()` returning a
@@ -109,17 +119,18 @@ M = Margins(fit, analytic=False)  # force central finite differences everywhere
 
 ## Design choices worth knowing
 
-1. **`atmeans` averages the design matrix by default.** This matches
+1. **`at="mean"` averages the design matrix by default.** This matches
    Stata's `margins, atmeans` and statsmodels' `get_margeff(at='mean')`:
    numeric columns become their sample mean, factor dummies become their
    observed proportions (a "person" who is 0.33 female). The test suite
    verifies a match to `statsmodels.get_margeff(at='mean')` to machine
-   precision. Pass `factor_stat="mode"` for numeric columns at their mean, 
-   factors held at their modal
-   level — which gives a "typical individual" rather than a fictional
-   fractional one. Williams (Margins01) notes that atmeans-on-dummies is
-   usually a worse choice than AME regardless of which convention you
-   pick, so prefer AME for factor-heavy models.
+   precision. Pass `factor_stat="mode"` for the modal-individual variant
+   (numerics at their mean, factors at their modal level) — gives a
+   "typical individual" rather than a fictional fractional one.
+   `factor_stat="zero"` puts factors at their reference level instead.
+   Williams (Margins01) notes that atmeans-on-dummies is usually a worse
+   choice than AME regardless of which convention you pick, so prefer
+   AME for factor-heavy models.
 
 2. **`dydx` is response-scale by default.** For GLMs this means
    $\partial\hat\mu / \partial x$, not $\partial\hat\eta / \partial x$.
@@ -199,7 +210,7 @@ Two small additions turn the module into a full DiD estimator:
 M = Margins(fit)
 res = M.did("group", "preexist_Y",
             group_levels=["A", "B"], condition_levels=[0, 1],
-            at={"age": 60, "female": 0})  # optional: fix covariates
+            atexog={"age": 60, "female": 0})  # optional: fix covariates
 print(res)          # shows cells + simple effects + DiD
 res.did.estimate    # the DiD point estimate
 res.did.ci_lower    # lower 95% CI
