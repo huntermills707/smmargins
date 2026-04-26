@@ -483,11 +483,47 @@ class Margins:
                     row[c] = col.iloc[0]
         return pd.DataFrame([row])
 
+    def _median_row(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """One-row frame: median for numeric columns, mode for the rest.
+
+        Matches ``get_margeff(at='median')``: evaluate at the column-wise
+        median of each covariate, with factors held at their modal level.
+        """
+        row = {}
+        for c in frame.columns:
+            col = frame[c]
+            if pd.api.types.is_numeric_dtype(col) and not pd.api.types.is_bool_dtype(col):
+                row[c] = col.median()
+            else:
+                try:
+                    row[c] = col.mode().iloc[0]
+                except Exception:
+                    row[c] = col.iloc[0]
+        return pd.DataFrame([row])
+
+    def _zero_row(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """One-row frame: numeric columns at zero, factors at first observed level.
+
+        Matches ``get_margeff(at='zero')``.
+        """
+        row = {}
+        for c in frame.columns:
+            col = frame[c]
+            if pd.api.types.is_numeric_dtype(col) and not pd.api.types.is_bool_dtype(col):
+                row[c] = 0.0
+            else:
+                try:
+                    row[c] = sorted(col.dropna().unique())[0]
+                except TypeError:
+                    row[c] = col.iloc[0]
+        return pd.DataFrame([row])
+
     @staticmethod
     def _check_factor_stat(factor_stat: str) -> None:
-        if factor_stat not in ("mean", "mode"):
+        if factor_stat not in ("mean", "mode", "median", "zero"):
             raise ValueError(
-                f"factor_stat must be 'mean' or 'mode', got {factor_stat!r}"
+                f"factor_stat must be 'mean', 'mode', 'median', or 'zero', "
+                f"got {factor_stat!r}"
             )
 
     # ---- the delta-method worker ----
@@ -533,17 +569,22 @@ class Margins:
         atmeans : bool
             If True, compute at the means of all variables (modified by
             any ``at=`` overrides) rather than averaging over the sample.
-        factor_stat : {"mean", "mode"}, default "mean"
-            How to summarize non-numeric / categorical variables when
-            ``atmeans=True``.
+        factor_stat : {"mean", "mode", "median", "zero"}, default "mean"
+            How to summarize covariates when ``atmeans=True``.
 
             - ``"mean"`` (default): average the *design matrix* (so each
               dummy column gets its observed proportion). Matches Stata's
               ``margins, atmeans`` and statsmodels'
               ``get_margeff(at='mean')``.
-            - ``"mode"``: pick the modal level of each factor on the
-              original data frame, giving a "typical individual" rather
-              than a fictional fractional one.
+            - ``"median"``: evaluate at the column-wise median of each
+              numeric covariate (mode for factors). Matches
+              ``get_margeff(at='median')``.
+            - ``"zero"``: evaluate at zero for all numeric covariates
+              (first observed level for factors). Matches
+              ``get_margeff(at='zero')``.
+            - ``"mode"``: numeric columns at their mean, factors at their
+              modal level — a "typical individual" rather than a fictional
+              fractional one.
 
             Ignored when ``atmeans=False``.
 
@@ -566,6 +607,10 @@ class Margins:
         collapse = atmeans and factor_stat == "mean"
         if atmeans and factor_stat == "mode":
             base = self._means_row(self.data)
+        elif atmeans and factor_stat == "median":
+            base = self._median_row(self.data)
+        elif atmeans and factor_stat == "zero":
+            base = self._zero_row(self.data)
         else:
             base = self.data
         frames, at_labels = self._expand_at(base, at)
@@ -697,6 +742,10 @@ class Margins:
         collapse = atmeans and factor_stat == "mean"
         if atmeans and factor_stat == "mode":
             base = self._means_row(self.data)
+        elif atmeans and factor_stat == "median":
+            base = self._median_row(self.data)
+        elif atmeans and factor_stat == "zero":
+            base = self._zero_row(self.data)
         else:
             base = self.data
         frames, at_labels = self._expand_at(base, at)
