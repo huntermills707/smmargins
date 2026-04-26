@@ -34,8 +34,20 @@ all fit the $g(\beta)$ schema:
 | Contrast  | $E[f(\cdot)\mid x_j=\text{level}] - E[f(\cdot)\mid x_j=\text{ref}]$     |
 
 where $f$ is the response-scale map (identity for OLS, inverse link for
-GLMs, etc.). The module obtains $G$ by central finite differences of
-$g$ with respect to $\beta$, so the same code handles every model.
+GLMs, etc.). Every statistic above is a linear combination of
+mean-predictions $\frac{1}{n}\sum_i f(x_i^\top\beta)$ on different
+design matrices, so the single Jacobian primitive needed is
+
+$$
+\frac{\partial}{\partial\beta}\,\frac{1}{n}\sum_i f(x_i^\top\beta)
+\;=\; \frac{1}{n}\sum_i f'(x_i^\top\beta)\,x_i .
+$$
+
+The module computes $f'$ analytically when the model exposes it (any
+GLM via `family.link.inverse_deriv` — Logit, Probit, Poisson, NegBin,
+Gamma, Gaussian — plus OLS/WLS/GLS via the identity link), and falls
+back to central finite differences when it doesn't. See design choice
+4 below.
 
 ## Why patsy
 
@@ -84,6 +96,11 @@ Each call returns a `MarginsResult` with `.estimate`, `.se`, `.vcov`,
 DataFrame. Use `use_t=True` on the `Margins` constructor if you want
 t-distribution inference (reads `results.df_resid`).
 
+```python
+M = Margins(fit, analytic=True)   # default: analytic outer Jacobian when possible
+M = Margins(fit, analytic=False)  # force central finite differences everywhere
+```
+
 ## Design choices worth knowing
 
 1. **`atmeans` averages the design matrix by default.** This matches
@@ -91,8 +108,8 @@ t-distribution inference (reads `results.df_resid`).
    numeric columns become their sample mean, factor dummies become their
    observed proportions (a "person" who is 0.33 female). The test suite
    verifies a match to `statsmodels.get_margeff(at='mean')` to machine
-   precision. Pass `factor_stat="mode"` to fall back to the alternative
-   behavior — numeric columns at their mean, factors held at their modal
+   precision. Pass `factor_stat="mode"` for numeric columns at their mean, 
+   factors held at their modal
    level — which gives a "typical individual" rather than a fictional
    fractional one. Williams (Margins01) notes that atmeans-on-dummies is
    usually a worse choice than AME regardless of which convention you
@@ -105,12 +122,25 @@ t-distribution inference (reads `results.df_resid`).
 3. **Discrete vs continuous is auto-detected**, based on dtype and number
    of unique values. Override with `discrete=True`/`False` if needed.
 
-4. **Numerical differentiation** uses central differences with
-   $h = \epsilon^{1/3}\cdot\max(|x|, 1)$ — the theoretically optimal
-   trade-off between truncation and rounding error for central
-   differences. For the $\partial g/\partial\beta$ step we use the same
-   rule on $\beta$. Tests show we recover analytic SEs to 5–6 decimal
-   places.
+4. **Outer Jacobian is analytic when possible, FD otherwise.** Every
+   statistic in this module is a linear combination of mean-predictions
+   $\frac{1}{n}\sum_i f(x_i^\top\beta)$, whose gradient is
+   $\frac{1}{n}\sum_i f'(x_i^\top\beta)\,x_i$. We obtain $f'$
+   analytically for any GLM via `family.link.inverse_deriv` (Logit,
+   Probit, Poisson, NegBin, Gamma, Gaussian) and via the identity link
+   for OLS/WLS/GLS. For continuous AME we still perturb the **data
+   column** with central differences — patsy doesn't expose symbolic
+   derivatives of basis transforms (`I(x**2)`, `bs(...)`, `cr(...)`,
+   interactions) — but that's a single 2-rebuild step, independent of
+   $p$. When `family.link.inverse_deriv` is missing (custom `Link`
+   subclass), an offset/exposure is present (so $\eta\neq X\beta$), or
+   the model is neither GLM nor a linear-regression model, the entire
+   Jacobian falls back to central finite differences with
+   $h = \epsilon^{1/3}\cdot\max(|x|, 1)$ — the truncation-vs-rounding
+   sweet spot. Stata's `margins` uses FD throughout; our analytic path
+   removes $p$ forward `predict` calls per statistic without changing
+   any answer to within FD tolerance. Pass `analytic=False` to force
+   FD on every model.
 
 5. **Everything goes through `model.predict(params, exog)`.** That way
    the inverse link, offsets, exposures, and any other model-specific
@@ -132,6 +162,13 @@ t-distribution inference (reads `results.df_resid`).
 - **Poisson AAP** with hand-derived $g$ gradient. Matches exactly; and
   sanity-checks that AAP equals the sample mean for canonical-link
   Poisson.
+- **Analytic-vs-FD parity matrix.** Every public API call (AAP, APM,
+  APR, AME, MEM, MER — continuous and discrete) is run twice on each
+  of OLS+poly, Logit+`C(grp)`, and Poisson, with `analytic=True` and
+  `analytic=False`, and the two paths must agree on both estimate and
+  SE. This guards against the analytic chain-rule formula drifting
+  from the FD answer that the other tests pin to Stata /
+  `get_margeff`.
 
 ## Difference-in-differences
 

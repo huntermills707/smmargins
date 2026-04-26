@@ -79,6 +79,11 @@ print()
 # ---------------------------------------------------------------------------
 # DiD on the *probability* (response) scale — what the clinical question asks
 # ---------------------------------------------------------------------------
+# Margins(fit) uses analytic outer Jacobians via family.link.inverse_deriv
+# when available (Logit qualifies), falling back to central finite
+# differences otherwise. did() reuses predict()'s machinery, so it
+# inherits the analytic path automatically. Set Margins(fit,
+# analytic=False) to force FD if you ever want to cross-check.
 M = Margins(fit)
 did = M.did("group", "preexist_Y",
             group_levels=["A", "B"],

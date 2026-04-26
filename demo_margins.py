@@ -67,6 +67,13 @@ print("=" * 80)
 print(fit.summary().tables[1])
 print()
 
+# `analytic=True` is the default: the outer ∂g/∂β goes through
+# `family.link.inverse_deriv` for any GLM (Logit/Probit/Poisson/...) and
+# the identity link for OLS/WLS/GLS, falling back to central finite
+# differences only when the link derivative isn't available. Set
+# `analytic=False` to force FD; you'll get the same answers (see the
+# parity check at the bottom of this file) but pay p extra forward
+# predict() calls per statistic.
 M = Margins(fit)
 
 # ---------------------------------------------------------------------------
@@ -143,3 +150,24 @@ print("7. Predicted Pr(voted) over age, for each sex")
 print("=" * 80)
 tbl = M.predict(at={"age": list(range(20, 91, 10)), "female": [0, 1]})
 print(tbl)
+
+# ---------------------------------------------------------------------------
+# 8. Analytic vs FD: same answers, faster path
+#    Logit exposes `family.link.inverse_deriv`, so the analytic outer
+#    Jacobian is used by default. Toggling `analytic=False` reroutes
+#    every statistic through central finite differences — useful as a
+#    sanity check or when working with a custom Link subclass that
+#    doesn't implement inverse_deriv.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("8. Analytic vs FD — same numbers, taken via different paths")
+print("=" * 80)
+M_fd = Margins(fit, analytic=False)
+ame_an = M.dydx("age")
+ame_fd = M_fd.dydx("age")
+print(f"AME(age) analytic : est={ame_an.estimate[0]: .8f}  se={ame_an.se[0]: .8f}")
+print(f"AME(age) FD       : est={ame_fd.estimate[0]: .8f}  se={ame_fd.se[0]: .8f}")
+print(f"max abs diff      : "
+      f"est {abs(ame_an.estimate[0] - ame_fd.estimate[0]): .2e}, "
+      f"se {abs(ame_an.se[0] - ame_fd.se[0]): .2e}")
