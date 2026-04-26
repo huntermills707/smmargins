@@ -108,8 +108,8 @@ M = Margins(fit, analytic=False)  # force central finite differences everywhere
    numeric columns become their sample mean, factor dummies become their
    observed proportions (a "person" who is 0.33 female). The test suite
    verifies a match to `statsmodels.get_margeff(at='mean')` to machine
-   precision. Pass `factor_stat="mode"` to fall back to the alternative
-   behavior — numeric columns at their mean, factors held at their modal
+   precision. Pass `factor_stat="mode"` for numeric columns at their mean, 
+   factors held at their modal
    level — which gives a "typical individual" rather than a fictional
    fractional one. Williams (Margins01) notes that atmeans-on-dummies is
    usually a worse choice than AME regardless of which convention you
