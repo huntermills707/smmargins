@@ -88,6 +88,7 @@ M.dydx("*")                                       # all RHS columns
 M.dydx("x1", at="mean")                           # MEM (factors at proportions)
 M.dydx("x1", at="median")                         # ME at medians
 M.dydx("x1", atexog={"x2": [0, 1]})               # MER
+M.dydx("kids", count=True)                        # unit increment x -> x+1 (for integers)
 M.dydx("group")                                   # discrete contrasts vs reference level
 M.dydx("group", reference="b")                    # discrete contrasts vs "b"
 

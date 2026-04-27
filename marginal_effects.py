@@ -730,6 +730,7 @@ class Margins:
         at: str = "overall",
         atexog: Optional[Mapping[str, object]] = None,
         discrete: Optional[bool] = None,
+        count: bool = False,
         step: Optional[float] = None,
         reference: Optional[object] = None,
         factor_stat: Optional[str] = None,
@@ -750,6 +751,9 @@ class Margins:
               - non-numeric or boolean dtype  -> discrete
               - numeric with ≤ 2 unique values -> discrete
               - else                           -> continuous derivative.
+        count : bool, default False
+            If True, treat as a numeric variable with a unit increment (x -> x+1).
+            Useful for integer-valued covariates.
         step : float, optional
             Step size for the continuous derivative. Default is
             ``(eps**(1/3)) * max(std(x), 1)`` (central-difference sweet spot).
@@ -789,6 +793,7 @@ class Margins:
         At zero                       ``dydx("x1", at="zero")``
         Multi-variable                ``dydx(["x1", "x2"])``
         All RHS columns               ``dydx("*")``
+        With unit increment           ``dydx("kids", count=True)``
         ============================  =====================================
         """
         if method not in _METHOD_META:
@@ -814,9 +819,37 @@ class Margins:
         base, collapse = self._resolve_base(at, factor_stat)
         frames, at_labels = self._expand_at(base, atexog)
 
+        if count:
+            if discrete is True:
+                raise ValueError(
+                    "count=True is itself a discrete contrast; do not also pass "
+                    "discrete=True"
+                )
+            if method != "dydx":
+                raise ValueError("count=True is only valid with method='dydx'")
+
         parts = []
         for v in variables:
             col = self.data[v]
+            if count:
+                if not pd.api.types.is_numeric_dtype(col):
+                    raise ValueError(
+                        f"count=True requires a numeric variable; {v!r} has "
+                        f"dtype {col.dtype}"
+                    )
+                if not pd.api.types.is_integer_dtype(col):
+                    import warnings
+                    warnings.warn(
+                        f"count=True applied to a float column ({v!r}); "
+                        "the contrast x -> x+1 may not be physically meaningful.",
+                        RuntimeWarning
+                    )
+                res_parts = self._dydx_count_components(
+                    v, frames, at_labels, collapse=collapse
+                )
+                parts.append(res_parts)
+                continue
+
             v_discrete = discrete
             if v_discrete is None:
                 if (pd.api.types.is_bool_dtype(col)
@@ -1000,6 +1033,58 @@ class Margins:
             variable, frames, at_labels, step, at, collapse, method
         )
         return self._delta(stat, labels=labels, stat_name=stat_name, jac=jac)
+
+    # ----- count case (unit increment x -> x+1) ----------------------------
+
+    def _dydx_count_components(
+        self,
+        variable: str,
+        frames: List[pd.DataFrame],
+        at_labels: List[str],
+        collapse: bool = False,
+    ):
+        Xs_p = []
+        Xs_m = []
+        labels = []
+
+        for frame, at_lab in zip(frames, at_labels):
+            # x -> x + 1
+            f_p = frame.copy()
+            f_p[variable] = f_p[variable] + 1
+            f_m = frame.copy()
+
+            Xp = self._build_exog(f_p)
+            Xm = self._build_exog(f_m)
+
+            if collapse:
+                Xp = Xp.mean(axis=0, keepdims=True)
+                Xm = Xm.mean(axis=0, keepdims=True)
+
+            Xs_p.append(Xp)
+            Xs_m.append(Xm)
+
+            base = f"{variable} (count)"
+            labels.append(f"{base} | {at_lab}" if at_lab else base)
+
+        def statistic(beta: np.ndarray) -> np.ndarray:
+            out = np.empty(len(Xs_p))
+            for i, (Xp, Xm) in enumerate(zip(Xs_p, Xs_m)):
+                out[i] = np.mean(self._predict(beta, Xp)) - np.mean(self._predict(beta, Xm))
+            return out
+
+        jac = None
+        if self.analytic:
+            fprime = self._link_deriv()
+            if fprime is not None:
+                def jac(beta: np.ndarray) -> np.ndarray:
+                    J = np.empty((len(Xs_p), beta.size))
+                    for i, (Xp, Xm) in enumerate(zip(Xs_p, Xs_m)):
+                        gp = self._grad_mean_predict(Xp, beta, fprime)
+                        gm = self._grad_mean_predict(Xm, beta, fprime)
+                        J[i, :] = gp - gm
+                    return J
+
+        return (statistic, jac, labels, "dy/dx")
 
     # ----- discrete case (contrast vs reference level) ---------------------
 
