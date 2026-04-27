@@ -596,10 +596,14 @@ class Margins:
         beta = self.params
         est_val = statistic(beta)
         est = np.atleast_1d(np.asarray(est_val, dtype=float)).ravel()
+
         if jac is not None:
             J = np.atleast_2d(np.asarray(jac(beta), dtype=float))
         else:
+            # We must pass the user-provided 'statistic' directly to the
+            # numerical differentiator.
             J = _central_jacobian(statistic, beta)
+
         V = J @ self.cov @ J.T
         return MarginsResult(
             estimate=est, vcov=V, labels=labels,
@@ -847,26 +851,31 @@ class Margins:
             def stacked_stat(beta: np.ndarray) -> np.ndarray:
                 res = []
                 for fn, _, _, _ in p_list:
-                    val = np.atleast_1d(fn(beta))
+                    # fn is the statistic function for one variable. 
+                    # We MUST pass beta to it.
+                    val = np.atleast_1d(np.asarray(fn(beta), dtype=float)).ravel()
                     res.append(val)
                 return np.concatenate(res)
             return stacked_stat
 
-        def make_stacked_jac(p_list, m_obj):
-            def stacked_jac(beta: np.ndarray) -> Optional[np.ndarray]:
-                # All-or-nothing on analytic Jacobian. Mixing analytic and FD blocks
-                # in one delta call is not supported in v1.
-                if any(j is None for _, j, _, _ in p_list):
-                    return None
+        def make_stacked_jac(p_list):
+            # All-or-nothing on analytic Jacobian. Mixing analytic and FD blocks
+            # in one delta call is not supported in v1.
+            if any(p[1] is None for p in p_list):
+                return None
+
+            def stacked_jac(beta: np.ndarray) -> np.ndarray:
                 res = []
                 for _, j, _, _ in p_list:
-                    val = np.atleast_2d(j(beta))
+                    # j is the jacobian function for one variable.
+                    # We MUST pass beta to it.
+                    val = np.atleast_2d(np.asarray(j(beta), dtype=float))
                     res.append(val)
                 return np.vstack(res)
             return stacked_jac
 
-        stacked_stat = make_stacked_stat(parts, self)
-        stacked_jac = make_stacked_jac(parts, self)
+        statistic = make_stacked_stat(parts, self)
+        jac_fn = make_stacked_jac(parts)
 
         labels = []
         for _, _, p_labels, _ in parts:
@@ -875,7 +884,7 @@ class Margins:
         names = {p[3] for p in parts}
         stat_name = names.pop() if len(names) == 1 else "mixed"
 
-        return self._delta(stacked_stat, labels=labels, stat_name=stat_name, jac=stacked_jac)
+        return self._delta(statistic, labels=labels, stat_name=stat_name, jac=jac_fn)
 
     # ----- continuous case (numerical derivative) ---------------------------
 
@@ -942,7 +951,7 @@ class Margins:
                         contrib = dydx_i * x_vals[i] / y_i
                     else:  # eydx
                         contrib = dydx_i / y_i
-                out[i] = float(np.mean(contrib))
+                out[i] = np.mean(contrib)
             return out
 
         # Analytic Jacobian only for the level case ("dydx"); the three
@@ -951,7 +960,7 @@ class Margins:
         # would require quotient-rule code with no numerical benefit
         # over straight FD, so we keep the analytic path narrow.
         jac = None
-        if method == "dydx":
+        if method == "dydx" and self.analytic:
             fprime = self._link_deriv()
             if fprime is not None:
                 def jac(beta: np.ndarray) -> np.ndarray:
@@ -1034,20 +1043,20 @@ class Margins:
         def statistic(beta: np.ndarray) -> np.ndarray:
             out = np.empty(len(Xs_lvl))
             for i, (Xl, Xr) in enumerate(zip(Xs_lvl, Xs_ref)):
-                out[i] = float(np.mean(self._predict(beta, Xl))
-                               - np.mean(self._predict(beta, Xr)))
+                out[i] = np.mean(self._predict(beta, Xl)) - np.mean(self._predict(beta, Xr))
             return out
 
         jac = None
-        fprime = self._link_deriv()
-        if fprime is not None:
-            def jac(beta: np.ndarray) -> np.ndarray:
-                J = np.empty((len(Xs_lvl), beta.size))
-                for i, (Xl, Xr) in enumerate(zip(Xs_lvl, Xs_ref)):
-                    gl = self._grad_mean_predict(Xl, beta, fprime)
-                    gr = self._grad_mean_predict(Xr, beta, fprime)
-                    J[i, :] = gl - gr
-                return J
+        if self.analytic:
+            fprime = self._link_deriv()
+            if fprime is not None:
+                def jac(beta: np.ndarray) -> np.ndarray:
+                    J = np.empty((len(Xs_lvl), beta.size))
+                    for i, (Xl, Xr) in enumerate(zip(Xs_lvl, Xs_ref)):
+                        gl = self._grad_mean_predict(Xl, beta, fprime)
+                        gr = self._grad_mean_predict(Xr, beta, fprime)
+                        J[i, :] = gl - gr
+                    return J
 
         return (statistic, jac, labels, "contrast")
 
