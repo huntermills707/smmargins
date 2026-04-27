@@ -110,6 +110,20 @@ fixes specific variables at specific values (Stata's `margins, at(...)`);
 unlike statsmodels' `atexog`, it's keyed by **variable name** rather than
 column index.
 
+### Formula vs. Raw Exog Mode
+
+`Margins` supports models fit without formulas (e.g. `sm.OLS(y, X).fit()`).
+In this "raw mode", variable names are taken from `model.exog_names` (often
+`x1, x2, ...` or `const`).
+
+**Important Limitation:** In raw mode, `Margins` does not know about
+relationships between columns in the design matrix. If you manually
+included an interaction column (e.g. `X["x1_x2"] = X["x1"] * X["x2"]`),
+perturbing `x1` for a marginal effect will **not** automatically update
+`x1_x2`. This will lead to incorrect marginal effects for that variable.
+If your model has interactions or transformations, you should fit it using
+a formula to ensure `Margins` can correctly rebuild the design matrix.
+
 Each call returns a `MarginsResult` with `.estimate`, `.se`, `.vcov`,
 `.ci_lower`, `.ci_upper`, `.pvalue`, plus `.summary()` returning a
 DataFrame. Use `use_t=True` on the `Margins` constructor if you want

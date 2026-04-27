@@ -296,6 +296,22 @@ class Margins:
         derivative (any GLM via ``family.link.inverse_deriv``, plus
         ``OLS``/``WLS``/``GLS`` via the identity link). Falls back to central
         finite differences otherwise. Set to False to force FD everywhere.
+
+    Notes
+    -----
+    **Formula vs. Raw Exog Mode**
+
+    If the model was fit using a formula (e.g. ``smf.ols("y ~ x1 + x2", data)``),
+    ``Margins`` uses the model's ``DesignInfo`` to rebuild the design matrix.
+    This ensures that interactions (``x1:x2``) and transformations (``log(x1)``)
+    are correctly updated when a single variable is perturbed for marginal
+    effects.
+
+    If the model was fit using raw matrices (e.g. ``sm.OLS(y, X).fit()``),
+    ``Margins`` operates in "raw mode". In this mode, only the literal column
+    corresponding to the variable is perturbed. Interactions or pre-computed
+    transformations in the design matrix will *not* be automatically updated.
+    To correctly handle such models, it is recommended to fit using formulas.
     """
 
     def __init__(
@@ -319,8 +335,18 @@ class Margins:
         self.df = getattr(results, "df_resid", None) if use_t else None
         self.analytic = analytic
 
+        self.design_info = self._try_get_design_info()
+        self._raw_mode = self.design_info is None
+
         if data is None:
             data = self._try_get_data()
+        if data is None and self._raw_mode:
+            # Synthesize data from model.exog
+            exog = np.asarray(self.model.exog)
+            names = list(getattr(self.model, "exog_names", None) or
+                         [f"x{i}" for i in range(exog.shape[1])])
+            data = pd.DataFrame(exog, columns=names)
+
         if data is None:
             raise ValueError(
                 "Could not retrieve the original data frame from the model; "
@@ -328,14 +354,20 @@ class Margins:
             )
         self.data = data.copy()
 
-        self.design_info = self._try_get_design_info()
-        if self.design_info is None:
-            raise ValueError(
-                "This Margins implementation relies on a patsy DesignInfo. "
-                "Fit the model with a formula, e.g. using "
-                "``statsmodels.formula.api`` or by passing patsy matrices "
-                "explicitly."
-            )
+        if self._raw_mode:
+            # Sanity check alignment
+            n_exog = self.model.exog.shape[1]
+            n_params = self.params.size
+            if n_exog != n_params:
+                raise ValueError(
+                    f"Model has {n_exog} exog columns but {n_params} parameters. "
+                    "Cannot use raw mode."
+                )
+            if len(self.model.exog_names) != n_params:
+                raise ValueError(
+                    f"Model has {len(self.model.exog_names)} exog_names but "
+                    f"{n_params} parameters. Cannot use raw mode."
+                )
 
     # ---- model / data introspection ----
 
@@ -358,13 +390,15 @@ class Margins:
     # ---- building design matrices ----
 
     def _build_exog(self, frame: pd.DataFrame) -> np.ndarray:
-        """Build a numeric design matrix from a data frame using stored DesignInfo.
+        """Build a numeric design matrix from a data frame.
 
-        This is the single place where patsy's formula machinery is used,
-        so interactions, ``I(...)`` transforms, splines, and ``C(...)``
-        categoricals are all rebuilt consistently when columns of ``frame``
-        are modified.
+        If the model was fit with a formula, this uses patsy's DesignInfo
+        to rebuild the matrix (handling interactions, etc.). If fit with
+        raw matrices, it selects columns matching ``model.exog_names``.
         """
+        if self._raw_mode:
+            cols = list(self.model.exog_names)
+            return np.asarray(frame[cols].to_numpy(dtype=float))
         dm = patsy.dmatrix(self.design_info, frame, return_type="matrix")
         return np.asarray(dm)
 
@@ -815,6 +849,20 @@ class Margins:
             variables = [variable]
         else:
             variables = list(variable)
+
+        if self._raw_mode:
+            valid = list(self.model.exog_names)
+            for v in variables:
+                if v not in valid:
+                    raise ValueError(
+                        f"Variable {v!r} not found in model's exog columns. "
+                        f"Valid names: {valid}"
+                    )
+                if v in ("const", "Intercept") and discrete is None:
+                    raise ValueError(
+                        f"Cannot compute marginal effect for the constant {v!r}. "
+                        "If you intended a discrete change, set discrete=True."
+                    )
 
         base, collapse = self._resolve_base(at, factor_stat)
         frames, at_labels = self._expand_at(base, atexog)
