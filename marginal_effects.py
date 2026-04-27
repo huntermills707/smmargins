@@ -79,7 +79,7 @@ def _central_jacobian(
 
     Returns
     -------
-    ndarray of shape (m, p), or (p,) if ``m == 1``.
+    ndarray of shape (m, p).
     """
     x = np.asarray(x, dtype=float).ravel()
     p = x.size
@@ -87,18 +87,29 @@ def _central_jacobian(
         rel_step = np.finfo(float).eps ** (1.0 / 3.0)
     h = rel_step * np.maximum(np.abs(x), 1.0)
 
+    # Initial call to determine output size m
     f0 = np.atleast_1d(np.asarray(func(x), dtype=float)).ravel()
     m = f0.size
     J = np.empty((m, p))
 
     for i in range(p):
-        x_plus = x.copy(); x_plus[i] += h[i]
-        x_minus = x.copy(); x_minus[i] -= h[i]
+        xi = x[i]
+        hi = h[i]
+        
+        # Perturb only dimension i
+        x_plus = x.copy()
+        x_plus[i] = xi + hi
+        
+        x_minus = x.copy()
+        x_minus[i] = xi - hi
+        
         fp = np.atleast_1d(np.asarray(func(x_plus), dtype=float)).ravel()
         fm = np.atleast_1d(np.asarray(func(x_minus), dtype=float)).ravel()
-        J[:, i] = (fp - fm) / (2.0 * h[i])
+        
+        # Central difference for each output component
+        J[:, i] = (fp - fm) / (2.0 * hi)
 
-    return J.ravel() if m == 1 else J
+    return J
 
 
 # ---------------------------------------------------------------------------
@@ -583,11 +594,12 @@ class Margins:
         jac: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ) -> MarginsResult:
         beta = self.params
-        est = np.atleast_1d(np.asarray(statistic(beta), dtype=float)).ravel()
+        est_val = statistic(beta)
+        est = np.atleast_1d(np.asarray(est_val, dtype=float)).ravel()
         if jac is not None:
             J = np.atleast_2d(np.asarray(jac(beta), dtype=float))
         else:
-            J = np.atleast_2d(_central_jacobian(statistic, beta))
+            J = _central_jacobian(statistic, beta)
         V = J @ self.cov @ J.T
         return MarginsResult(
             estimate=est, vcov=V, labels=labels,
@@ -710,7 +722,7 @@ class Margins:
 
     def dydx(
         self,
-        variable: str,
+        variable: Union[str, List[str]],
         at: str = "overall",
         atexog: Optional[Mapping[str, object]] = None,
         discrete: Optional[bool] = None,
@@ -723,13 +735,14 @@ class Margins:
 
         Parameters
         ----------
-        variable : str
-            Column name in the fitting data frame.
+        variable : str, list of str, or "*"
+            Column name(s) in the fitting data frame. If ``"*"``, use all
+            non-response columns in the data frame.
         at, atexog, factor_stat : see :meth:`predict`.
         discrete : bool, optional
             If True, use discrete changes (level vs reference).
             If False, use a numerical derivative.
-            If None (default), auto-detect:
+            If None (default), auto-detect per-variable:
               - non-numeric or boolean dtype  -> discrete
               - numeric with ≤ 2 unique values -> discrete
               - else                           -> continuous derivative.
@@ -770,6 +783,8 @@ class Margins:
         MER (eff. at rep. values)     ``dydx("x1", atexog={"x2": [0, 1]})``
         At medians                    ``dydx("x1", at="median")``
         At zero                       ``dydx("x1", at="zero")``
+        Multi-variable                ``dydx(["x1", "x2"])``
+        All RHS columns               ``dydx("*")``
         ============================  =====================================
         """
         if method not in _METHOD_META:
@@ -781,40 +796,90 @@ class Margins:
             factor_stat = self._default_factor_stat(at)
         self._check_factor_stat(factor_stat)
 
-        col = self.data[variable]
-
-        if discrete is None:
-            if (pd.api.types.is_bool_dtype(col)
-                    or not pd.api.types.is_numeric_dtype(col)):
-                discrete = True
-            elif pd.api.types.is_numeric_dtype(col) and col.dropna().nunique() <= 2:
-                discrete = True
-            else:
-                discrete = False
-
-        if discrete and method != "dydx":
-            raise ValueError(
-                f"method={method!r} requires a continuous variable; "
-                f"got discrete=True for {variable!r}. "
-                f"Pass discrete=False to override."
-            )
+        if variable == "*":
+            # All columns minus the response. This may include columns not
+            # used in the model, which matches requested v1 behavior.
+            variable = self.data.columns.difference(
+                [self.model.endog_names]
+            ).tolist()
+        if isinstance(variable, str):
+            variables = [variable]
+        else:
+            variables = list(variable)
 
         base, collapse = self._resolve_base(at, factor_stat)
         frames, at_labels = self._expand_at(base, atexog)
 
-        if discrete:
-            return self._dydx_discrete(
-                variable, frames, at_labels, reference=reference,
-                collapse=collapse,
-            )
-        return self._dydx_continuous(
-            variable, frames, at_labels, step=step, at=at,
-            collapse=collapse, method=method,
-        )
+        parts = []
+        for v in variables:
+            col = self.data[v]
+            v_discrete = discrete
+            if v_discrete is None:
+                if (pd.api.types.is_bool_dtype(col)
+                        or not pd.api.types.is_numeric_dtype(col)):
+                    v_discrete = True
+                elif pd.api.types.is_numeric_dtype(col) and col.dropna().nunique() <= 2:
+                    v_discrete = True
+                else:
+                    v_discrete = False
+
+            if v_discrete and method != "dydx":
+                raise ValueError(
+                    f"method={method!r} requires a continuous variable; "
+                    f"got discrete=True for {v!r}. "
+                    f"Pass discrete=False to override."
+                )
+
+            if v_discrete:
+                res_parts = self._dydx_discrete_components(
+                    v, frames, at_labels, reference=reference,
+                    collapse=collapse,
+                )
+                parts.append(res_parts)
+            else:
+                res_parts = self._dydx_continuous_components(
+                    v, frames, at_labels, step=step, at=at,
+                    collapse=collapse, method=method,
+                )
+                parts.append(res_parts)
+
+        def make_stacked_stat(p_list, m_obj):
+            def stacked_stat(beta: np.ndarray) -> np.ndarray:
+                res = []
+                for fn, _, _, _ in p_list:
+                    val = np.atleast_1d(fn(beta))
+                    res.append(val)
+                return np.concatenate(res)
+            return stacked_stat
+
+        def make_stacked_jac(p_list, m_obj):
+            def stacked_jac(beta: np.ndarray) -> Optional[np.ndarray]:
+                # All-or-nothing on analytic Jacobian. Mixing analytic and FD blocks
+                # in one delta call is not supported in v1.
+                if any(j is None for _, j, _, _ in p_list):
+                    return None
+                res = []
+                for _, j, _, _ in p_list:
+                    val = np.atleast_2d(j(beta))
+                    res.append(val)
+                return np.vstack(res)
+            return stacked_jac
+
+        stacked_stat = make_stacked_stat(parts, self)
+        stacked_jac = make_stacked_jac(parts, self)
+
+        labels = []
+        for _, _, p_labels, _ in parts:
+            labels.extend(p_labels)
+
+        names = {p[3] for p in parts}
+        stat_name = names.pop() if len(names) == 1 else "mixed"
+
+        return self._delta(stacked_stat, labels=labels, stat_name=stat_name, jac=stacked_jac)
 
     # ----- continuous case (numerical derivative) ---------------------------
 
-    def _dydx_continuous(
+    def _dydx_continuous_components(
         self,
         variable: str,
         frames: List[pd.DataFrame],
@@ -823,7 +888,7 @@ class Margins:
         at: str,
         collapse: bool = False,
         method: str = "dydx",
-    ) -> MarginsResult:
+    ):
         if step is None:
             sd = float(self.data[variable].std(ddof=0))
             scale = max(sd, abs(float(self.data[variable].mean())), 1.0)
@@ -885,6 +950,7 @@ class Margins:
         # for the inner ∂y/∂β with analytic for the elasticity scaling
         # would require quotient-rule code with no numerical benefit
         # over straight FD, so we keep the analytic path narrow.
+        jac = None
         if method == "dydx":
             fprime = self._link_deriv()
             if fprime is not None:
@@ -895,10 +961,6 @@ class Margins:
                         gm = self._grad_mean_predict(Xm, beta, fprime)
                         J[i, :] = (gp - gm) / (2.0 * h)
                     return J
-            else:
-                jac = None
-        else:
-            jac = None
 
         meta = _METHOD_META[method]
         prefix, stat_name = meta["prefix"], meta["stat_name"]
@@ -913,18 +975,33 @@ class Margins:
         else:
             labels = [f"{prefix}{variable} | {lab}" if lab else f"{prefix}{variable}"
                       for lab in at_labels]
-        return self._delta(statistic, labels=labels, stat_name=stat_name, jac=jac)
+        return (statistic, jac, labels, stat_name)
+
+    def _dydx_continuous(
+        self,
+        variable: str,
+        frames: List[pd.DataFrame],
+        at_labels: List[str],
+        step: Optional[float],
+        at: str,
+        collapse: bool = False,
+        method: str = "dydx",
+    ) -> MarginsResult:
+        stat, jac, labels, stat_name = self._dydx_continuous_components(
+            variable, frames, at_labels, step, at, collapse, method
+        )
+        return self._delta(stat, labels=labels, stat_name=stat_name, jac=jac)
 
     # ----- discrete case (contrast vs reference level) ---------------------
 
-    def _dydx_discrete(
+    def _dydx_discrete_components(
         self,
         variable: str,
         frames: List[pd.DataFrame],
         at_labels: List[str],
         reference: Optional[object],
         collapse: bool = False,
-    ) -> MarginsResult:
+    ):
         levels = self.data[variable].dropna().unique().tolist()
         try:
             levels = sorted(levels)
@@ -961,6 +1038,7 @@ class Margins:
                                - np.mean(self._predict(beta, Xr)))
             return out
 
+        jac = None
         fprime = self._link_deriv()
         if fprime is not None:
             def jac(beta: np.ndarray) -> np.ndarray:
@@ -970,10 +1048,21 @@ class Margins:
                     gr = self._grad_mean_predict(Xr, beta, fprime)
                     J[i, :] = gl - gr
                 return J
-        else:
-            jac = None
 
-        return self._delta(statistic, labels=labels, stat_name="contrast", jac=jac)
+        return (statistic, jac, labels, "contrast")
+
+    def _dydx_discrete(
+        self,
+        variable: str,
+        frames: List[pd.DataFrame],
+        at_labels: List[str],
+        reference: Optional[object],
+        collapse: bool = False,
+    ) -> MarginsResult:
+        stat, jac, labels, stat_name = self._dydx_discrete_components(
+            variable, frames, at_labels, reference, collapse
+        )
+        return self._delta(stat, labels=labels, stat_name=stat_name, jac=jac)
 
     # ======================================================================
     # Public API: difference-in-differences

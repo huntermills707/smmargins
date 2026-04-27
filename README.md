@@ -83,6 +83,8 @@ M.predict(atexog={"x1": [0, 1, 2]}, at="mean")    # APR holding others at means
 
 # --- marginal effects ---
 M.dydx("x1")                                      # AME (continuous auto-detected)
+M.dydx(["x1", "x2"])                              # multiple variables stacked jointly
+M.dydx("*")                                       # all RHS columns
 M.dydx("x1", at="mean")                           # MEM (factors at proportions)
 M.dydx("x1", at="median")                         # ME at medians
 M.dydx("x1", atexog={"x2": [0, 1]})               # MER
