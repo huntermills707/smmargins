@@ -50,6 +50,7 @@ update correctly and automatically.
 from __future__ import annotations
 
 import itertools
+from dataclasses import dataclass
 from typing import Callable, Optional, Union, Sequence, Mapping, List
 
 import numpy as np
@@ -269,6 +270,55 @@ class MarginsResult:
 
     def __repr__(self) -> str:
         return self.summary().to_string(float_format=lambda v: f"{v: .6f}")
+
+
+# ---------------------------------------------------------------------------
+# Evaluation profile
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Profile:
+    """How to turn a data-space frame into the design matrix used for a statistic.
+
+    The two flags express the semantic split that the ``at`` / ``factor_stat``
+    combinations encode, applied at different phases:
+
+    - ``collapse_numerics`` (pre-perturbation): replace observed (row-varying)
+      numeric columns in the *data-space frame* with their training mean.
+      Needed for count and discrete contrasts under MEM so derived columns
+      like ``I(x**2)`` evaluate to ``mean(x)**2`` rather than ``mean(x**2)``.
+      Continuous-derivative paths leave this off because their FD step relies
+      on per-row variation in ``variable``. Applied by the caller (e.g.
+      ``_design_pairs``) *before* perturbing the frame, so that the
+      perturbation isn't overwritten.
+    - ``collapse_design`` (post-build): after ``_build_exog``, average rows
+      column-wise so factor dummies become observed proportions.
+      Stata's ``atmeans``. Applied by ``materialize``.
+    """
+
+    frame: pd.DataFrame
+    collapse_design: bool = False
+    collapse_numerics: bool = False
+
+    def prepare_frame(self, frame: pd.DataFrame, margins: "Margins") -> pd.DataFrame:
+        if self.collapse_numerics:
+            return margins._collapse_numerics_to_mean(frame)
+        return frame
+
+    def materialize(self, frame: pd.DataFrame, margins: "Margins") -> np.ndarray:
+        """Run the full pipeline (numerics collapse → build → design collapse).
+
+        Use this when there's no perturbation step in between, e.g. ``predict``
+        or the unperturbed reference design in elasticities. Paired-contrast
+        callers need to interleave a perturb step between the two phases —
+        they should call ``prepare_frame`` themselves, perturb, then build /
+        ``collapse_design`` manually (or use ``_design_pairs``).
+        """
+        frame = self.prepare_frame(frame, margins)
+        X = margins._build_exog(frame)
+        if self.collapse_design:
+            X = X.mean(axis=0, keepdims=True)
+        return X
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +578,71 @@ class Margins:
         fp = np.asarray(fprime(eta), dtype=float).ravel()
         return (fp[:, None] * X).sum(axis=0) / X.shape[0]
 
+    # ---- shared paired-contrast machinery ------------------------------------
+    #
+    # Every dydx variant — continuous (level), count, discrete — is a list of
+    # contrasts ``E[f(X_a)] - E[f(X_b)]`` over pairs of design matrices, often
+    # multiplied by a constant. ``_design_pairs`` builds those pairs from a
+    # callable that returns the ``(a, b)`` data-space frames for one input
+    # frame; ``_paired_contrast`` turns the list of pairs into a
+    # ``(statistic, jac)`` tuple suitable for ``_delta``.
+
+    def _design_pairs(
+        self,
+        profile: _Profile,
+        frames: List[pd.DataFrame],
+        perturb: Callable[[pd.DataFrame], tuple[pd.DataFrame, pd.DataFrame]],
+    ) -> List[tuple[np.ndarray, np.ndarray]]:
+        # Numerics-collapse runs *before* perturb, so the perturbation
+        # (e.g. ``variable + 1``) isn't overwritten by the mean-substitution.
+        out: List[tuple[np.ndarray, np.ndarray]] = []
+        for fr in frames:
+            prepared = profile.prepare_frame(fr, self)
+            fa, fb = perturb(prepared)
+            Xa = self._build_exog(fa)
+            Xb = self._build_exog(fb)
+            if profile.collapse_design:
+                Xa = Xa.mean(axis=0, keepdims=True)
+                Xb = Xb.mean(axis=0, keepdims=True)
+            out.append((Xa, Xb))
+        return out
+
+    def _paired_contrast(
+        self,
+        pairs: Sequence[tuple[np.ndarray, np.ndarray]],
+        scale: float = 1.0,
+    ) -> tuple[Callable[[np.ndarray], np.ndarray],
+               Optional[Callable[[np.ndarray], np.ndarray]]]:
+        """``E[f(X_a)] - E[f(X_b)]`` per pair, scaled by ``scale``.
+
+        Returns ``(statistic, jac)``. ``jac`` is None when no analytic
+        link derivative is available — the caller falls back to FD via
+        ``_central_jacobian``.
+        """
+        n = len(pairs)
+
+        def statistic(beta: np.ndarray) -> np.ndarray:
+            out = np.empty(n)
+            for i, (Xa, Xb) in enumerate(pairs):
+                ya = float(np.mean(self._predict(beta, Xa)))
+                yb = float(np.mean(self._predict(beta, Xb)))
+                out[i] = (ya - yb) * scale
+            return out
+
+        fprime = self._link_deriv()
+        if fprime is None:
+            return statistic, None
+
+        def jac(beta: np.ndarray) -> np.ndarray:
+            J = np.empty((n, beta.size))
+            for i, (Xa, Xb) in enumerate(pairs):
+                ga = self._grad_mean_predict(Xa, beta, fprime)
+                gb = self._grad_mean_predict(Xb, beta, fprime)
+                J[i, :] = (ga - gb) * scale
+            return J
+
+        return statistic, jac
+
     # ---- utilities for building "at" frames ----
 
     @staticmethod
@@ -658,20 +773,19 @@ class Margins:
         except TypeError:
             return u[0]
 
-    def _resolve_base(self, at: str, factor_stat: str) -> tuple[pd.DataFrame, bool]:
-        """Return ``(base_frame, collapse)``.
+    def _resolve_base(self, at: str, factor_stat: str) -> _Profile:
+        """Return the evaluation profile for ``(at, factor_stat)``.
 
-        ``collapse=True`` means the caller should apply
-        ``X.mean(axis=0, keepdims=True)`` to the design matrix after
-        building it — this is how factor dummies become their observed
-        proportions (Stata's ``atmeans`` semantics).
-
-        ``collapse=False`` means ``base_frame`` is already a single
-        representative row, with both numeric and factor columns
-        materialized in data space.
+        ``profile.collapse_design`` is True iff factors should end up at
+        their observed proportions (Stata ``atmeans`` semantics).
+        ``profile.collapse_numerics`` is always False here — the count
+        and discrete contrast paths flip it on themselves before
+        materializing, since they need a single design row in data space
+        rather than the design-column averages that the continuous FD
+        path relies on.
         """
         if at == "overall":
-            return self.data, False
+            return _Profile(frame=self.data, collapse_design=False)
 
         if factor_stat == "mean":
             # Modify numerics in data space; leave factors observed and
@@ -690,9 +804,10 @@ class Margins:
                 elif at == "zero":
                     f[c] = 0.0
                 # at == "mean": X.mean handles it without touching the data.
-            return f, True
+            return _Profile(frame=f, collapse_design=True)
 
-        return self._single_row(at, factor_stat), False
+        return _Profile(frame=self._single_row(at, factor_stat),
+                        collapse_design=False)
 
     def _collapse_numerics_to_mean(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Replace observed (row-varying) numeric columns with their training mean.
@@ -839,8 +954,8 @@ class Margins:
             factor_stat = self._default_factor_stat(at)
         self._check_factor_stat(factor_stat)
 
-        base, collapse = self._resolve_base(at, factor_stat)
-        frames, at_labels = self._expand_at(base, atexog)
+        profile = self._resolve_base(at, factor_stat)
+        frames, at_labels = self._expand_at(profile.frame, atexog)
 
         stat_name = "prediction"
         if atexog is None:
@@ -853,12 +968,7 @@ class Margins:
         else:
             labels = at_labels
 
-        Xs = []
-        for f in frames:
-            X = self._build_exog(f)
-            if collapse:
-                X = X.mean(axis=0, keepdims=True)
-            Xs.append(X)
+        Xs = [profile.materialize(f, self) for f in frames]
 
         def statistic(beta: np.ndarray) -> np.ndarray:
             out = np.empty(len(Xs))
@@ -988,8 +1098,8 @@ class Margins:
                         "If you intended a discrete change, set discrete=True."
                     )
 
-        base, collapse = self._resolve_base(at, factor_stat)
-        frames, at_labels = self._expand_at(base, atexog)
+        profile = self._resolve_base(at, factor_stat)
+        frames, at_labels = self._expand_at(profile.frame, atexog)
 
         if count:
             if discrete is True:
@@ -1017,7 +1127,7 @@ class Margins:
                         RuntimeWarning
                     )
                 res_parts = self._dydx_count_components(
-                    v, frames, at_labels, collapse=collapse
+                    v, profile, frames, at_labels,
                 )
                 parts.append(res_parts)
                 continue
@@ -1041,14 +1151,13 @@ class Margins:
 
             if v_discrete:
                 res_parts = self._dydx_discrete_components(
-                    v, frames, at_labels, reference=reference,
-                    collapse=collapse,
+                    v, profile, frames, at_labels, reference=reference,
                 )
                 parts.append(res_parts)
             else:
                 res_parts = self._dydx_continuous_components(
-                    v, frames, at_labels, step=step, at=at,
-                    collapse=collapse, method=method,
+                    v, profile, frames, at_labels, step=step, at=at,
+                    method=method,
                 )
                 parts.append(res_parts)
 
@@ -1093,14 +1202,29 @@ class Margins:
 
     # ----- continuous case (numerical derivative) ---------------------------
 
+    @staticmethod
+    def _continuous_label_suffix(at: str) -> str:
+        return {"overall": "", "mean": " (at means)",
+                "median": " (at medians)", "zero": " (at zero)"}[at]
+
+    def _continuous_labels(
+        self, variable: str, method: str, at: str, at_labels: List[str],
+        n_frames: int,
+    ) -> List[str]:
+        prefix = _METHOD_META[method]["prefix"]
+        if n_frames == 1 and at_labels[0] == "":
+            return [f"{prefix}{variable}{self._continuous_label_suffix(at)}"]
+        return [f"{prefix}{variable} | {lab}" if lab else f"{prefix}{variable}"
+                for lab in at_labels]
+
     def _dydx_continuous_components(
         self,
         variable: str,
+        profile: _Profile,
         frames: List[pd.DataFrame],
         at_labels: List[str],
         step: Optional[float],
         at: str,
-        collapse: bool = False,
         method: str = "dydx",
     ):
         if step is None:
@@ -1109,43 +1233,47 @@ class Margins:
             step = (np.finfo(float).eps ** (1.0 / 3.0)) * scale
         h = float(step)
 
-        # For ``eyex``/``eydx`` we need ``y_i = f(eta_i)`` evaluated at
-        # the *unperturbed* design row, so we keep an extra ``Xs_orig``.
-        need_y = method in ("eyex", "eydx")
+        labels = self._continuous_labels(variable, method, at, at_labels, len(frames))
+        stat_name = _METHOD_META[method]["stat_name"]
 
+        def perturb(fr: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+            x_col = np.asarray(fr[variable], dtype=float)
+            fp = fr.copy(); fp[variable] = x_col + h
+            fm = fr.copy(); fm[variable] = x_col - h
+            return fp, fm
+
+        if method == "dydx":
+            # Pure paired contrast scaled by 1/(2h) — analytic jac available.
+            pairs = self._design_pairs(profile, frames, perturb)
+            statistic, jac = self._paired_contrast(pairs, scale=1.0 / (2.0 * h))
+            return (statistic, jac, labels, stat_name)
+
+        # Elasticity branches need per-row x_i (and per-row y_i for eyex/eydx),
+        # so they don't fit the simple paired-mean schema. Build the same
+        # design pairs, but keep the original (unperturbed) design and the
+        # original x column around for the per-row scaling.
+        need_y = method in ("eyex", "eydx")
         Xs_plus: List[np.ndarray] = []
         Xs_minus: List[np.ndarray] = []
         Xs_orig: List[np.ndarray] = []
         x_vals: List[np.ndarray] = []
-        for frame in frames:
-            x_col = np.asarray(frame[variable], dtype=float)
-            f_plus = frame.copy()
-            f_minus = frame.copy()
-            f_plus[variable] = x_col + h
-            f_minus[variable] = x_col - h
-            Xp = self._build_exog(f_plus)
-            Xm = self._build_exog(f_minus)
-            Xo = self._build_exog(frame) if need_y else None
-            if collapse:
-                Xp = Xp.mean(axis=0, keepdims=True)
-                Xm = Xm.mean(axis=0, keepdims=True)
-                if Xo is not None:
-                    Xo = Xo.mean(axis=0, keepdims=True)
+        for fr in frames:
+            x_col = np.asarray(fr[variable], dtype=float)
+            fp, fm = perturb(fr)
+            Xs_plus.append(profile.materialize(fp, self))
+            Xs_minus.append(profile.materialize(fm, self))
+            if need_y:
+                Xs_orig.append(profile.materialize(fr, self))
+            if profile.collapse_design:
                 x_col = np.array([x_col.mean()])
-            Xs_plus.append(Xp)
-            Xs_minus.append(Xm)
-            if Xo is not None:
-                Xs_orig.append(Xo)
             x_vals.append(x_col)
 
         def statistic(beta: np.ndarray) -> np.ndarray:
             out = np.empty(len(Xs_plus))
             for i in range(len(Xs_plus)):
-                Xp, Xm = Xs_plus[i], Xs_minus[i]
-                dydx_i = (self._predict(beta, Xp) - self._predict(beta, Xm)) / (2.0 * h)
-                if method == "dydx":
-                    contrib = dydx_i
-                elif method == "dyex":
+                dydx_i = (self._predict(beta, Xs_plus[i])
+                          - self._predict(beta, Xs_minus[i])) / (2.0 * h)
+                if method == "dyex":
                     contrib = dydx_i * x_vals[i]
                 else:  # eyex / eydx
                     y_i = self._predict(beta, Xs_orig[i])
@@ -1156,114 +1284,38 @@ class Margins:
                 out[i] = np.mean(contrib)
             return out
 
-        # Analytic Jacobian only for the level case ("dydx"); the three
-        # elasticities go through FD via _central_jacobian. Mixing FD
-        # for the inner ∂y/∂β with analytic for the elasticity scaling
-        # would require quotient-rule code with no numerical benefit
-        # over straight FD, so we keep the analytic path narrow.
-        jac = None
-        if method == "dydx" and self.analytic:
-            fprime = self._link_deriv()
-            if fprime is not None:
-                def jac(beta: np.ndarray) -> np.ndarray:
-                    J = np.empty((len(Xs_plus), beta.size))
-                    for i, (Xp, Xm) in enumerate(zip(Xs_plus, Xs_minus)):
-                        gp = self._grad_mean_predict(Xp, beta, fprime)
-                        gm = self._grad_mean_predict(Xm, beta, fprime)
-                        J[i, :] = (gp - gm) / (2.0 * h)
-                    return J
-
-        meta = _METHOD_META[method]
-        prefix, stat_name = meta["prefix"], meta["stat_name"]
-        suffix_map = {
-            "overall": "",
-            "mean":    " (at means)",
-            "median":  " (at medians)",
-            "zero":    " (at zero)",
-        }
-        if len(frames) == 1 and at_labels[0] == "":
-            labels = [f"{prefix}{variable}{suffix_map[at]}"]
-        else:
-            labels = [f"{prefix}{variable} | {lab}" if lab else f"{prefix}{variable}"
-                      for lab in at_labels]
-        return (statistic, jac, labels, stat_name)
-
-    def _dydx_continuous(
-        self,
-        variable: str,
-        frames: List[pd.DataFrame],
-        at_labels: List[str],
-        step: Optional[float],
-        at: str,
-        collapse: bool = False,
-        method: str = "dydx",
-    ) -> MarginsResult:
-        stat, jac, labels, stat_name = self._dydx_continuous_components(
-            variable, frames, at_labels, step, at, collapse, method
-        )
-        return self._delta(stat, labels=labels, stat_name=stat_name, jac=jac)
+        # Analytic outer jac would require quotient-rule plumbing for the
+        # per-row 1/y_i; FD is fine.
+        return (statistic, None, labels, stat_name)
 
     # ----- count case (unit increment x -> x+1) ----------------------------
 
     def _dydx_count_components(
         self,
         variable: str,
+        profile: _Profile,
         frames: List[pd.DataFrame],
         at_labels: List[str],
-        collapse: bool = False,
     ):
-        # Stata-style MEM-count semantics: when ``collapse`` is on
-        # (factor_stat="mean"), the contrast should be evaluated as
-        # f(η at the mean profile, x+1) − f(η at the mean profile, x),
-        # i.e. derived columns like ``I(x**2)`` use ``mean(x)**2`` —
-        # not ``mean(x**2)``. The "perturb each row, then column-mean"
-        # approach drops that h² term only for h→0 (the FD continuous
-        # path); for the unit increment of count it leaves a residual
-        # of order Var(x)·β. So pre-collapse non-fixed numerics here.
-        if collapse:
-            frames = [self._collapse_numerics_to_mean(fr) for fr in frames]
+        # Under ``collapse_design`` we also collapse_numerics, so that
+        # I(x**2)-style derived columns evaluate to mean(x)**2 rather than
+        # mean(x**2) — i.e. the contrast becomes f(η at mean+1) − f(η at
+        # mean), Stata-style. The continuous-FD path doesn't need this
+        # because its O(h²) residual vanishes; the unit increment doesn't.
+        profile = _Profile(
+            frame=profile.frame,
+            collapse_design=profile.collapse_design,
+            collapse_numerics=profile.collapse_design,
+        )
 
-        Xs_p = []
-        Xs_m = []
-        labels = []
+        def perturb(fr: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+            fp = fr.copy(); fp[variable] = fp[variable] + 1
+            return fp, fr
 
-        for frame, at_lab in zip(frames, at_labels):
-            # x -> x + 1
-            f_p = frame.copy()
-            f_p[variable] = f_p[variable] + 1
-            f_m = frame.copy()
-
-            Xp = self._build_exog(f_p)
-            Xm = self._build_exog(f_m)
-
-            if collapse:
-                Xp = Xp.mean(axis=0, keepdims=True)
-                Xm = Xm.mean(axis=0, keepdims=True)
-
-            Xs_p.append(Xp)
-            Xs_m.append(Xm)
-
-            base = f"{variable} (count)"
-            labels.append(f"{base} | {at_lab}" if at_lab else base)
-
-        def statistic(beta: np.ndarray) -> np.ndarray:
-            out = np.empty(len(Xs_p))
-            for i, (Xp, Xm) in enumerate(zip(Xs_p, Xs_m)):
-                out[i] = np.mean(self._predict(beta, Xp)) - np.mean(self._predict(beta, Xm))
-            return out
-
-        jac = None
-        if self.analytic:
-            fprime = self._link_deriv()
-            if fprime is not None:
-                def jac(beta: np.ndarray) -> np.ndarray:
-                    J = np.empty((len(Xs_p), beta.size))
-                    for i, (Xp, Xm) in enumerate(zip(Xs_p, Xs_m)):
-                        gp = self._grad_mean_predict(Xp, beta, fprime)
-                        gm = self._grad_mean_predict(Xm, beta, fprime)
-                        J[i, :] = gp - gm
-                    return J
-
+        pairs = self._design_pairs(profile, frames, perturb)
+        statistic, jac = self._paired_contrast(pairs)
+        base = f"{variable} (count)"
+        labels = [f"{base} | {lab}" if lab else base for lab in at_labels]
         return (statistic, jac, labels, "dy/dx")
 
     # ----- discrete case (contrast vs reference level) ---------------------
@@ -1271,15 +1323,17 @@ class Margins:
     def _dydx_discrete_components(
         self,
         variable: str,
+        profile: _Profile,
         frames: List[pd.DataFrame],
         at_labels: List[str],
         reference: Optional[object],
-        collapse: bool = False,
     ):
-        # See ``_dydx_count_components`` for why non-fixed numerics are
-        # collapsed to their training mean here under ``collapse``.
-        if collapse:
-            frames = [self._collapse_numerics_to_mean(fr) for fr in frames]
+        # See ``_dydx_count_components`` for why we collapse numerics here.
+        profile = _Profile(
+            frame=profile.frame,
+            collapse_design=profile.collapse_design,
+            collapse_numerics=profile.collapse_design,
+        )
 
         levels = self.data[variable].dropna().unique().tolist()
         try:
@@ -1292,56 +1346,23 @@ class Margins:
             reference = levels[0]
         others = [lv for lv in levels if lv != reference]
 
-        Xs_lvl: List[np.ndarray] = []
-        Xs_ref: List[np.ndarray] = []
+        # One pair per (frame × non-reference level). Build manually rather
+        # than via ``_design_pairs``'s single-perturb callable. ``materialize``
+        # is safe here because ``variable`` is the discrete level being set;
+        # numerics-collapse runs first and doesn't touch it.
+        pairs: List[tuple[np.ndarray, np.ndarray]] = []
         labels: List[str] = []
         for frame, at_lab in zip(frames, at_labels):
             f_ref = frame.copy(); f_ref[variable] = reference
-            Xref = self._build_exog(f_ref)
-            if collapse:
-                Xref = Xref.mean(axis=0, keepdims=True)
+            Xref = profile.materialize(f_ref, self)
             for lvl in others:
                 f_lvl = frame.copy(); f_lvl[variable] = lvl
-                Xl = self._build_exog(f_lvl)
-                if collapse:
-                    Xl = Xl.mean(axis=0, keepdims=True)
-                Xs_lvl.append(Xl)
-                Xs_ref.append(Xref)
+                pairs.append((profile.materialize(f_lvl, self), Xref))
                 base = f"{variable}: {lvl} vs {reference}"
                 labels.append(f"{base} | {at_lab}" if at_lab else base)
 
-        def statistic(beta: np.ndarray) -> np.ndarray:
-            out = np.empty(len(Xs_lvl))
-            for i, (Xl, Xr) in enumerate(zip(Xs_lvl, Xs_ref)):
-                out[i] = np.mean(self._predict(beta, Xl)) - np.mean(self._predict(beta, Xr))
-            return out
-
-        jac = None
-        if self.analytic:
-            fprime = self._link_deriv()
-            if fprime is not None:
-                def jac(beta: np.ndarray) -> np.ndarray:
-                    J = np.empty((len(Xs_lvl), beta.size))
-                    for i, (Xl, Xr) in enumerate(zip(Xs_lvl, Xs_ref)):
-                        gl = self._grad_mean_predict(Xl, beta, fprime)
-                        gr = self._grad_mean_predict(Xr, beta, fprime)
-                        J[i, :] = gl - gr
-                    return J
-
+        statistic, jac = self._paired_contrast(pairs)
         return (statistic, jac, labels, "contrast")
-
-    def _dydx_discrete(
-        self,
-        variable: str,
-        frames: List[pd.DataFrame],
-        at_labels: List[str],
-        reference: Optional[object],
-        collapse: bool = False,
-    ) -> MarginsResult:
-        stat, jac, labels, stat_name = self._dydx_discrete_components(
-            variable, frames, at_labels, reference, collapse
-        )
-        return self._delta(stat, labels=labels, stat_name=stat_name, jac=jac)
 
     # ======================================================================
     # Public API: difference-in-differences
