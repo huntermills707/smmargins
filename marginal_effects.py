@@ -369,6 +369,45 @@ class Margins:
                     f"{n_params} parameters. Cannot use raw mode."
                 )
 
+        # Cache training offset/exposure for _predict broadcasting on smaller
+        # designs (MEM/APM/etc.). Without this, statsmodels' predict can't
+        # align a length-N stored offset against a 1-row exog and silently
+        # drops the offset. We collapse offset + log(exposure) into a single
+        # log-offset and pass it as ``offset=`` to predict — that way we
+        # don't have to care which storage convention the model uses
+        # (statsmodels stores ``model.exposure`` as ``log(exposure)`` for
+        # GLM, raw for discrete models, etc.).
+        self._n_train = (self.model.exog.shape[0]
+                         if getattr(self.model, "exog", None) is not None else None)
+        self._mean_log_offset_value = self._compute_mean_log_offset()
+
+    def _compute_mean_log_offset(self) -> Optional[float]:
+        """Mean of (offset + log(exposure)) across the training sample, or None."""
+        oe = getattr(self.model, "_offset_exposure", None)
+        if oe is not None:
+            a = np.asarray(oe, dtype=float).ravel()
+            if a.size > 0 and np.any(a):
+                return float(np.mean(a))
+            return None
+        # Fall back: combine offset and exposure manually. statsmodels stores
+        # ``exposure`` as already log-transformed for GLM; discrete models
+        # apply log internally too. Either way ``model.exposure`` is in log
+        # space when present.
+        parts = []
+        for attr in ("offset", "exposure"):
+            v = getattr(self.model, attr, None)
+            if v is None:
+                continue
+            a = np.asarray(v, dtype=float).ravel()
+            if a.size > 0 and np.any(a):
+                parts.append(a)
+        if not parts:
+            return None
+        try:
+            return float(np.mean(sum(parts)))
+        except ValueError:
+            return None
+
     # ---- model / data introspection ----
 
     def _try_get_data(self):
@@ -408,14 +447,26 @@ class Margins:
         """Return E[Y | X] (response scale) using the model's own predict.
 
         Many StatsModels results accept a ``params`` override to
-        ``model.predict``; for GLMs this applies the inverse link. We
-        fall back to a manual path if the model's ``predict`` doesn't
-        accept the override cleanly.
+        ``model.predict``; for GLMs this applies the inverse link. When
+        the model carries offset/exposure but the design has a different
+        row count than training (e.g. APM/MEM single rows), we broadcast
+        the *mean* training offset/exposure to the new design — otherwise
+        statsmodels can't align the stored length-N offset against the
+        smaller exog and silently drops it.
         """
+        exog_arr = np.asarray(exog)
+        n_exog = exog_arr.shape[0]
+        kwargs = {}
+        if (self._n_train is not None
+                and n_exog != self._n_train
+                and self._mean_log_offset_value is not None):
+            kwargs["offset"] = np.full(n_exog, self._mean_log_offset_value)
         try:
-            return np.asarray(self.model.predict(params, exog))
-        except Exception:
-            eta = np.asarray(exog) @ np.asarray(params)
+            return np.asarray(self.model.predict(params, exog, **kwargs))
+        except (TypeError, ValueError, KeyError):
+            eta = exog_arr @ np.asarray(params)
+            if "offset" in kwargs:
+                eta = eta + kwargs["offset"]
             fam = getattr(self.model, "family", None)
             if fam is not None:
                 return np.asarray(fam.link.inverse(eta))
@@ -512,8 +563,8 @@ class Margins:
 
         Numeric columns get the value implied by ``at``
         (mean / median / 0). Factor / categorical columns get the value
-        implied by ``factor_stat`` (modal level for ``"mode"``, first
-        observed level for ``"zero"``).
+        implied by ``factor_stat`` (modal level for ``"mode"``, the patsy
+        reference level for ``"zero"``).
 
         ``factor_stat="mean"`` is not handled here — the caller routes
         that through a design-matrix-collapse path so that factor dummies
@@ -545,16 +596,67 @@ class Margins:
                 except Exception:
                     row[c] = col.iloc[0]
             elif factor_stat == "zero":
-                try:
-                    row[c] = sorted(col.dropna().unique())[0]
-                except TypeError:
-                    row[c] = col.iloc[0]
+                row[c] = self._factor_reference_level(c)
             else:
                 raise ValueError(
                     f"_single_row called with factor_stat={factor_stat!r}; "
                     f"the 'mean' path uses design-matrix collapse instead."
                 )
         return pd.DataFrame([row])
+
+    def _factor_reference_level(self, col: str) -> object:
+        """Return the patsy reference level for a categorical column.
+
+        Probes one-row designs with ``col`` set to each observed level
+        (other variables held at simple defaults) and picks the level
+        whose 1-row design has the minimum L1 norm — i.e. the one that
+        contributes nothing to the linear predictor under default
+        contrasts. This matches the level that ``get_margeff(at='zero')``
+        implicitly picks when it sets the design row to zero.
+
+        Falls back to the alphabetically first observed level when not
+        in formula mode or when probing fails (custom Link subclasses,
+        non-standard ``DesignInfo``, etc.).
+        """
+        levels = self.data[col].dropna().unique().tolist()
+        try:
+            levels = sorted(levels)
+        except TypeError:
+            pass
+        if not levels:
+            return self.data[col].iloc[0]
+        if self._raw_mode or self.design_info is None or len(levels) < 2:
+            return levels[0]
+        probe = pd.DataFrame([{
+            c: self._probe_default(c) for c in self.data.columns
+        }])
+        best_lvl, best_norm = levels[0], None
+        for lvl in levels:
+            p = probe.copy()
+            p[col] = lvl
+            try:
+                X = self._build_exog(p)
+            except Exception:
+                continue
+            norm = float(np.abs(np.asarray(X)).sum())
+            if best_norm is None or norm < best_norm:
+                best_norm = norm
+                best_lvl = lvl
+        return best_lvl
+
+    def _probe_default(self, col: str):
+        """Default probe value: 0 for numerics, first sorted level otherwise."""
+        s = self.data[col]
+        if (pd.api.types.is_numeric_dtype(s)
+                and not pd.api.types.is_bool_dtype(s)):
+            return 0.0
+        u = s.dropna().unique().tolist()
+        if not u:
+            return s.iloc[0]
+        try:
+            return sorted(u)[0]
+        except TypeError:
+            return u[0]
 
     def _resolve_base(self, at: str, factor_stat: str) -> tuple[pd.DataFrame, bool]:
         """Return ``(base_frame, collapse)``.
@@ -591,6 +693,28 @@ class Margins:
             return f, True
 
         return self._single_row(at, factor_stat), False
+
+    def _collapse_numerics_to_mean(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Replace observed (row-varying) numeric columns with their training mean.
+
+        Used by the count and discrete dydx paths under ``collapse=True``
+        to give a single representative profile in *data space*, so that
+        derived columns like ``I(x**2)`` evaluate to ``mean(x)**2`` rather
+        than ``mean(x**2)``. Columns that are already constant in the
+        frame (e.g. fixed by ``atexog``) are left alone.
+        """
+        out = frame.copy()
+        for c in self.data.columns:
+            if c not in out.columns:
+                continue
+            col = self.data[c]
+            if not (pd.api.types.is_numeric_dtype(col)
+                    and not pd.api.types.is_bool_dtype(col)):
+                continue
+            if out[c].nunique(dropna=False) <= 1:
+                continue
+            out[c] = col.mean()
+        return out
 
     @staticmethod
     def _check_at(at: str) -> None:
@@ -987,10 +1111,7 @@ class Margins:
 
         # For ``eyex``/``eydx`` we need ``y_i = f(eta_i)`` evaluated at
         # the *unperturbed* design row, so we keep an extra ``Xs_orig``.
-        # For ``dyex``/``eyex`` we need the original ``x_i`` values, in
-        # the same shape as Xp/Xm rows after any collapsing.
         need_y = method in ("eyex", "eydx")
-        need_x = method in ("dyex", "eyex")
 
         Xs_plus: List[np.ndarray] = []
         Xs_minus: List[np.ndarray] = []
@@ -1091,6 +1212,17 @@ class Margins:
         at_labels: List[str],
         collapse: bool = False,
     ):
+        # Stata-style MEM-count semantics: when ``collapse`` is on
+        # (factor_stat="mean"), the contrast should be evaluated as
+        # f(η at the mean profile, x+1) − f(η at the mean profile, x),
+        # i.e. derived columns like ``I(x**2)`` use ``mean(x)**2`` —
+        # not ``mean(x**2)``. The "perturb each row, then column-mean"
+        # approach drops that h² term only for h→0 (the FD continuous
+        # path); for the unit increment of count it leaves a residual
+        # of order Var(x)·β. So pre-collapse non-fixed numerics here.
+        if collapse:
+            frames = [self._collapse_numerics_to_mean(fr) for fr in frames]
+
         Xs_p = []
         Xs_m = []
         labels = []
@@ -1144,6 +1276,11 @@ class Margins:
         reference: Optional[object],
         collapse: bool = False,
     ):
+        # See ``_dydx_count_components`` for why non-fixed numerics are
+        # collapsed to their training mean here under ``collapse``.
+        if collapse:
+            frames = [self._collapse_numerics_to_mean(fr) for fr in frames]
+
         levels = self.data[variable].dropna().unique().tolist()
         try:
             levels = sorted(levels)
@@ -1263,6 +1400,16 @@ class Margins:
             raise ValueError("DiD requires exactly 2 levels for each factor.")
 
         atexog_full = dict(atexog) if atexog else {}
+        for k, v in atexog_full.items():
+            # Lists/arrays would expand the cell grid past 4 and break
+            # the hard-coded contrast matrix below. Surface a clear error
+            # rather than letting ``cells.contrast`` fail downstream.
+            if (not np.isscalar(v)) and not isinstance(v, (str, bytes)):
+                raise ValueError(
+                    f"did() requires scalar atexog values; got list/array "
+                    f"for {k!r}. Loop over values yourself if you need a "
+                    f"DiD per profile."
+                )
         # Insert group first, condition second -> itertools.product iterates
         # with condition varying fastest: (g0,c0),(g0,c1),(g1,c0),(g1,c1)
         atexog_full[group] = g
