@@ -1,50 +1,60 @@
-"""
-marginal_effects.py
-===================
+r"""
+Stata-style ``margins`` for StatsModels with delta-method standard errors.
 
-Stata-style ``margins`` for StatsModels, with standard errors from the
-delta method.
+For a fitted model with parameter vector :math:`\hat\beta`, estimated
+covariance :math:`\widehat V(\hat\beta)`, and a (possibly vector-valued)
+statistic :math:`g(\beta)`, the delta method gives
 
-Reference formulas
-------------------
+.. math::
 
-For a fitted model with parameter vector :math:`\\hat\\beta`, estimated
-covariance :math:`\\widehat V(\\hat\\beta)`, and a (possibly vector-valued)
-statistic :math:`g(\\beta)` (e.g. an adjusted prediction or a marginal
-effect), the delta method gives
+    \widehat{\operatorname{Var}}\bigl[g(\hat\beta)\bigr]
+    \;\approx\; G\,\widehat V\,G^\top,
+    \qquad
+    G = \left.\frac{\partial g}{\partial \beta}\right|_{\hat\beta}.
 
-    Var[g(\\hat\\beta)] ≈ G \\, \\widehat V(\\hat\\beta) \\, G',
-
-where :math:`G = \\partial g / \\partial \\beta` evaluated at
-:math:`\\hat\\beta`. That is exactly what Stata's ``margins`` does; see
-https://www.stata.com/support/faqs/statistics/compute-standard-errors-with-margins/.
+Statistics
+----------
 
 This module supports every statistic discussed in Richard Williams'
 *Using the margins command* notes (Margins01):
 
-    * **AAP**  Average Adjusted Prediction
-    * **APM**  Adjusted Prediction at Means
-    * **APR**  Adjusted Predictions at Representative values
-    * **AME**  Average Marginal Effect
-    * **MEM**  Marginal Effect at Means
-    * **MER**  Marginal Effect at Representative values
-    * Discrete changes for factor / binary variables
+=========  ========================================================
+AAP        :math:`(1/n)\sum_i f(x_i^\top\beta)`  (avg adj. prediction)
+APM        :math:`f(\bar x^\top\beta)`  (prediction at means)
+APR        AAP with some :math:`x` fixed at representative values
+AME        :math:`(1/n)\sum_i \partial f(x_i^\top\beta)/\partial x_{ij}`
+MEM        :math:`\partial f(\bar x^\top\beta)/\partial x_j`  (ME at means)
+MER        AME with some :math:`x` held at representative values
+=========  ========================================================
 
-Design
-------
+where :math:`f` is the response-scale map (identity for OLS, inverse
+link for GLMs, etc.).
 
-Rather than hand-differentiating each model's linear predictor / link
-combination, we build every statistic as a *function of* :math:`\\beta`
-using StatsModels' own ``model.predict(params, exog)`` (which handles
-the inverse link). We then take the Jacobian of that function by central
-finite differences, and apply the delta method with ``results.cov_params()``.
+Patsy integration
+-----------------
 
-Patsy does the heavy lifting of propagating perturbations through
-interactions, polynomials, splines, and categorical encodings: when the
-user says "perturb ``x1``", we perturb the *column of the data frame*
-and let ``patsy.dmatrix(design_info, ...)`` rebuild the design matrix.
-This way ``I(x1**2)``, ``x1:x2``, ``C(group)``, ``bs(x1, df=4)`` all
-update correctly and automatically.
+Rather than hand-differentiating each model's link / linear-predictor
+combination, we build every statistic as a function of :math:`\beta`
+using StatsModels' own ``model.predict(params, exog)``.  Patsy does the
+heavy lifting of propagating perturbations through interactions,
+polynomials, splines, and categorical encodings: when the user says
+"perturb ``x1``", we perturb the *column of the data frame* and let
+``patsy.dmatrix(design_info, ...)`` rebuild the design matrix.  This
+way ``I(x1**2)``, ``x1:x2``, ``C(group)``, ``bs(x1, df=4)`` all update
+correctly and automatically.
+
+Examples
+--------
+>>> import numpy as np, pandas as pd
+>>> import statsmodels.formula.api as smf
+>>> from smmargins import Margins
+>>> df = pd.DataFrame({"y": [1, 2, 3], "x1": [1, 2, 3], "x2": [3, 2, 1]})
+>>> fit = smf.ols("y ~ x1 + x2", data=df).fit()
+>>> M = Margins(fit)
+>>> round(float(M.predict().estimate[0]), 6)
+2.0
+>>> float(M.dydx("x1").estimate[0])
+0.944...
 """
 
 from __future__ import annotations
@@ -68,19 +78,44 @@ def _central_jacobian(
     x: np.ndarray,
     rel_step: Optional[float] = None,
 ) -> np.ndarray:
-    """Jacobian of ``func`` at ``x`` via central differences.
+    r"""Jacobian of ``func`` at ``x`` via central differences.
+
+    This is a numerical-analysis primitive used throughout the module
+    whenever an analytic derivative is unavailable.
 
     Parameters
     ----------
     func : callable
         Maps a length-``p`` vector to a scalar or length-``m`` vector.
     x : ndarray of shape (p,)
+        Point at which to evaluate the Jacobian.
     rel_step : float, optional
-        Relative step. Default ``eps**(1/3)`` (good for central differences).
+        Relative step size. Default is :math:`\epsilon^{1/3}`, the
+        truncation-vs-rounding sweet spot for central differences.
 
     Returns
     -------
-    ndarray of shape (m, p).
+    ndarray of shape (m, p)
+        The Jacobian matrix :math:`J_{ij} = \partial f_i / \partial x_j`.
+
+    Notes
+    -----
+    Uses the central-difference formula
+
+    .. math::
+
+        \frac{\partial f}{\partial x_j}
+        \approx \frac{f(x + h e_j) - f(x - h e_j)}{2 h_j},
+
+    where :math:`h_j = \text{rel\_step} \cdot \max(|x_j|, 1)` and
+    :math:`e_j` is the j-th unit vector.  The truncation error is
+    :math:`O(h^2)` and the round-off error is :math:`O(\epsilon / h)`;
+    choosing :math:`h \sim \epsilon^{1/3}` balances the two.
+
+    References
+    ----------
+    Nocedal, J. and Wright, S. J. (2006). *Numerical Optimization*,
+    2nd ed., Springer.  Chapter 8 (Calculating Derivatives).
     """
     x = np.asarray(x, dtype=float).ravel()
     p = x.size
@@ -117,6 +152,7 @@ def _central_jacobian(
 # Marginal-effect method registry
 # ---------------------------------------------------------------------------
 #
+# Registry mapping method names to their column-prefix and statistic-name.
 # ``method`` selects the per-observation transform applied to the raw
 # derivative dy/dx_i before averaging:
 #
@@ -141,7 +177,39 @@ _METHOD_META = {
 # ---------------------------------------------------------------------------
 
 class MarginsResult:
-    """Container for margin estimates with delta-method standard errors.
+    r"""Container for margin estimates with delta-method standard errors.
+
+    Holds the point estimate, standard error, confidence interval,
+    p-value, and the full delta-method covariance matrix of a vector of
+    margin statistics (e.g. adjusted predictions or marginal effects).
+
+    For a fitted model with parameter vector :math:`\hat\beta`, estimated
+    covariance :math:`\widehat V(\hat\beta)`, and a (possibly
+    vector-valued) statistic :math:`g(\beta)`, the delta method gives
+
+    .. math::
+
+        \widehat{\mathrm{Var}}[g(\hat\beta)] \approx
+        G \, \widehat V \, G^\top,
+
+    where :math:`G = \partial g / \partial \beta|_{\hat\beta}`.
+
+    Parameters
+    ----------
+    estimate : ndarray
+        Point estimates.
+    vcov : ndarray
+        Full delta-method covariance of the estimates (useful for joint
+        tests).
+    labels : sequence of str, optional
+        Row labels. Defaults to ``["m1", "m2", ...]``.
+    level : float
+        Confidence level for intervals (default 0.95).
+    df : int or None
+        Residual degrees of freedom; if set, uses t-distribution for
+        p-values and CIs. Otherwise uses N(0,1).
+    stat_name : str
+        Column name for the statistic in :meth:`summary`.
 
     Attributes
     ----------
@@ -149,11 +217,35 @@ class MarginsResult:
     se       : ndarray
     labels   : list[str]
     vcov     : ndarray
-        Full delta-method covariance of the estimates (useful for joint tests).
+        Full delta-method covariance of the estimates (useful for joint
+        tests).
     level    : float
     df       : int or None
-        Residual degrees of freedom; if set, uses t-distribution for
-        p-values and CIs. Otherwise uses N(0,1).
+    ci_lower : ndarray
+    ci_upper : ndarray
+    pvalue   : ndarray
+    zstat    : ndarray
+    _test_name : str
+        ``"z"`` or ``"t"`` depending on whether the normal or
+        t-distribution is used.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from smmargins import MarginsResult
+    >>> est = np.array([1.0, 2.0])
+    >>> vcov = np.array([[0.25, 0.1], [0.1, 0.16]])
+    >>> res = MarginsResult(est, vcov, labels=["m1", "m2"])
+    >>> float(res.estimate[0])
+    1.0
+    >>> float(res.se[0])
+    0.5
+    >>> float(res.estimate[1])
+    2.0
+
+    See Also
+    --------
+    Margins
     """
 
     def __init__(
@@ -196,12 +288,12 @@ class MarginsResult:
         labels: Optional[Sequence[str]] = None,
         name: str = "contrast",
     ) -> "MarginsResult":
-        """Form linear contrasts of the estimates, with delta-method SEs.
+        r"""Form linear contrasts of the estimates, with delta-method SEs.
 
         If the estimates have joint covariance :math:`V_m`, any linear
-        combination :math:`C m` has covariance :math:`C V_m C^\\top`, and
+        combination :math:`C m` has covariance :math:`C V_m C^\top`, and
         :math:`V_m` was already built from the delta method on
-        :math:`\\beta`, so this is exact under the same approximation
+        :math:`\beta`, so this is exact under the same approximation
         (no extra differentiation).
 
         Parameters
@@ -214,9 +306,20 @@ class MarginsResult:
         name : str
             Column name for the statistic in the summary table.
 
+        Returns
+        -------
+        MarginsResult
+
+        Raises
+        ------
+        ValueError
+            If the number of contrast columns does not match the number of
+            estimates, or if ``labels`` length does not match the number of
+            contrasts.
+
         Examples
         --------
-        Simple effect of `treat` at `post=1`, from a 4-cell
+        Simple effect of ``treat`` at ``post=1``, from a 4-cell
         (treat × post) prediction ordered (0,0), (0,1), (1,0), (1,1)::
 
             cells.contrast([0, -1, 0, 1], labels=["treat effect | post=1"])
@@ -229,6 +332,19 @@ class MarginsResult:
                  [ 1,-1,-1, 1]],    # DiD
                 labels=["simple @post=0", "simple @post=1", "DiD"],
             )
+
+        References
+        ----------
+        [1] StataCorp. *Stata User's Guide*, Section
+           ``[R] margins, contrast``.
+        [2] Williams, R. (2012). Using the margins command to estimate
+           and interpret adjusted predictions and marginal effects.
+           *Stata Journal*, 12(2), 308–331.
+
+        See Also
+        --------
+        MarginsResult.summary
+        Margins.did
         """
         C = np.asarray(c, dtype=float)
         if C.ndim == 1:
@@ -254,6 +370,25 @@ class MarginsResult:
         )
 
     def summary(self) -> pd.DataFrame:
+        r"""Return a summary DataFrame with estimates, SEs, and confidence intervals.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per estimate, columns:
+            ``stat_name``, ``std.err``, ``z``/``t``, ``P>|z|``/``P>|t|``,
+            and the lower and upper confidence bounds.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> from smmargins import MarginsResult
+        >>> est = np.array([2.0])
+        >>> vcov = np.array([[0.04]])
+        >>> MarginsResult(est, vcov, labels=["b"]).summary()
+           margin  std.err     z  P>|z|  [95% CI lo]  [95% CI hi]
+        b     2.0      0.2  10.0    0.0     1.608007     2.391993
+        """
         tn = self._test_name
         pct = int(round(self.level * 100))
         return pd.DataFrame(
@@ -269,6 +404,7 @@ class MarginsResult:
         )
 
     def __repr__(self) -> str:
+        """Return a string representation of the summary table."""
         return self.summary().to_string(float_format=lambda v: f"{v: .6f}")
 
 
@@ -278,22 +414,32 @@ class MarginsResult:
 
 @dataclass
 class _Profile:
-    """How to turn a data-space frame into the design matrix used for a statistic.
+    """Evaluation profile: how to turn a data-space frame into a design matrix.
 
-    The two flags express the semantic split that the ``at`` / ``factor_stat``
-    combinations encode, applied at different phases:
+    The two flags express the semantic split that the ``at`` /
+    ``factor_stat`` combinations encode, applied at different phases.
 
-    - ``collapse_numerics`` (pre-perturbation): replace observed (row-varying)
-      numeric columns in the *data-space frame* with their training mean.
-      Needed for count and discrete contrasts under MEM so derived columns
-      like ``I(x**2)`` evaluate to ``mean(x)**2`` rather than ``mean(x**2)``.
-      Continuous-derivative paths leave this off because their FD step relies
-      on per-row variation in ``variable``. Applied by the caller (e.g.
-      ``_design_pairs``) *before* perturbing the frame, so that the
-      perturbation isn't overwritten.
-    - ``collapse_design`` (post-build): after ``_build_exog``, average rows
-      column-wise so factor dummies become observed proportions.
-      Stata's ``atmeans``. Applied by ``materialize``.
+    Attributes
+    ----------
+    frame : pd.DataFrame
+        The data-space frame used as the evaluation base.
+    collapse_design : bool, default False
+        If True, average the design matrix column-wise after building,
+        so factor dummies become their observed proportions (Stata
+        ``atmeans``).
+    collapse_numerics : bool, default False
+        If True, replace row-varying numeric columns in the data-space
+        frame with their training mean *before* perturbation. Needed
+        for count and discrete contrasts under MEM so derived columns
+        like ``I(x**2)`` evaluate to ``mean(x)**2``.
+
+    Notes
+    -----
+    ``collapse_numerics`` (pre-perturbation) is applied by the caller
+    (e.g. ``_design_pairs``) *before* perturbing the frame, so that
+    the perturbation is not overwritten by the mean-substitution.
+    ``collapse_design`` (post-build) is applied by ``materialize``
+    after ``_build_exog``.
     """
 
     frame: pd.DataFrame
@@ -301,18 +447,48 @@ class _Profile:
     collapse_numerics: bool = False
 
     def prepare_frame(self, frame: pd.DataFrame, margins: "Margins") -> pd.DataFrame:
+        """Apply numerics-collapse to a frame when configured.
+
+        Parameters
+        ----------
+        frame : pd.DataFrame
+            Data-space frame to prepare.
+        margins : Margins
+            Margins instance providing ``_collapse_numerics_to_mean``.
+
+        Returns
+        -------
+        pd.DataFrame
+            The prepared frame (collapsed or unchanged).
+        """
         if self.collapse_numerics:
             return margins._collapse_numerics_to_mean(frame)
         return frame
 
     def materialize(self, frame: pd.DataFrame, margins: "Margins") -> np.ndarray:
-        """Run the full pipeline (numerics collapse → build → design collapse).
+        """Run the full pipeline (numerics collapse \u2192 build \u2192 design collapse).
 
-        Use this when there's no perturbation step in between, e.g. ``predict``
-        or the unperturbed reference design in elasticities. Paired-contrast
-        callers need to interleave a perturb step between the two phases —
-        they should call ``prepare_frame`` themselves, perturb, then build /
-        ``collapse_design`` manually (or use ``_design_pairs``).
+        Parameters
+        ----------
+        frame : pd.DataFrame
+            Data-space frame to materialize.
+        margins : Margins
+            Margins instance providing ``_build_exog`` and
+            ``_collapse_numerics_to_mean``.
+
+        Returns
+        -------
+        ndarray
+            Final design matrix ready for prediction.
+
+        Notes
+        -----
+        Use this when there is no perturbation step in between, e.g.
+        ``predict`` or the unperturbed reference design in elasticities.
+        Paired-contrast callers need to interleave a perturb step between
+        the two phases \u2014 they should call ``prepare_frame`` themselves,
+        perturb, then build / ``collapse_design`` manually (or use
+        ``_design_pairs``).
         """
         frame = self.prepare_frame(frame, margins)
         X = margins._build_exog(frame)
@@ -326,7 +502,14 @@ class _Profile:
 # ---------------------------------------------------------------------------
 
 class Margins:
-    """Compute adjusted predictions and marginal effects for a StatsModels fit.
+    r"""Compute adjusted predictions and marginal effects for a StatsModels fit.
+
+    Rather than hand-differentiating each model's linear predictor / link
+    combination, every statistic is built as a *function of*
+    :math:`\beta` using ``model.predict(params, exog)`` (which handles
+    the inverse link). The Jacobian of that function is taken by central
+    finite differences, and the delta method is applied with
+    ``results.cov_params()``.
 
     Parameters
     ----------
@@ -342,7 +525,7 @@ class Margins:
         If True and ``results.df_resid`` is available, use t-distribution.
     analytic : bool
         If True (default), use an analytic outer Jacobian
-        :math:`\\partial g/\\partial\\beta` whenever the model exposes a link
+        :math:`\partial g/\partial\beta` whenever the model exposes a link
         derivative (any GLM via ``family.link.inverse_deriv``, plus
         ``OLS``/``WLS``/``GLS`` via the identity link). Falls back to central
         finite differences otherwise. Set to False to force FD everywhere.
@@ -362,6 +545,51 @@ class Margins:
     corresponding to the variable is perturbed. Interactions or pre-computed
     transformations in the design matrix will *not* be automatically updated.
     To correctly handle such models, it is recommended to fit using formulas.
+
+    **Delta method**
+
+    For a statistic :math:`g(\beta)` with Jacobian
+    :math:`G = \partial g / \partial \beta|_{\hat\beta}`, the delta
+    method approximates
+
+    .. math::
+
+        \widehat{\mathrm{Var}}[g(\hat\beta)] \approx
+        G \, \widehat V \, G^\top .
+
+    Examples
+    --------
+    >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+    >>> from smmargins import Margins
+    >>> np.random.seed(0)
+    >>> df = pd.DataFrame({
+    ...     "y": np.random.randn(8),
+    ...     "x1": np.random.randn(8),
+    ...     "x2": np.random.randn(8),
+    ...     "group": np.repeat(["A", "B"], 4),
+    ... })
+    >>> fit = smf.ols("y ~ x1 + x2 + C(group)", df).fit()
+    >>> m = Margins(fit)
+    >>> bool(m.predict().estimate[0] > 0)
+    True
+    >>> float(m.dydx("x1").estimate[0])
+    0.888...
+
+    References
+    ----------
+    [1] StataCorp. FAQ: How are the standard errors computed with
+       margins https://www.stata.com/support/faqs/statistics/compute-standard-errors-with-margins/
+    [2] Williams, R. (2012). Using the margins command to estimate and
+       interpret adjusted predictions and marginal effects.
+       Stata Journal, 12(2), 308–331
+       https://www3.nd.edu/~rwilliam/stats/Margins01.pdf
+    [3] Ai, C., & Norton, E. C. (2003). Interaction terms in logit and
+       probit models. Economics Letters, 80(1), 123–129
+       https://doi.org/10.1016/S0165-1765(03)00032-6
+
+    See Also
+    --------
+    MarginsResult
     """
 
     def __init__(
@@ -432,7 +660,22 @@ class Margins:
         self._mean_log_offset_value = self._compute_mean_log_offset()
 
     def _compute_mean_log_offset(self) -> Optional[float]:
-        """Mean of (offset + log(exposure)) across the training sample, or None."""
+        """Mean of (offset + log(exposure)) across the training sample.
+
+        Returns
+        -------
+        float or None
+            The mean log-offset when offset/exposure is present and
+            non-zero; ``None`` otherwise.
+
+        Notes
+        -----
+        This value is used for offset/exposure broadcasting when the
+        design matrix has fewer rows than the training sample (e.g.
+        APM/MEM single-row evaluations). Without it, statsmodels
+        cannot align a length-N stored offset against a 1-row exog
+        and silently drops the offset term.
+        """
         oe = getattr(self.model, "_offset_exposure", None)
         if oe is not None:
             a = np.asarray(oe, dtype=float).ravel()
@@ -461,12 +704,34 @@ class Margins:
     # ---- model / data introspection ----
 
     def _try_get_data(self):
+        """Attempt to retrieve the original fitting data frame from the model.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            The original data frame when available; ``None`` otherwise.
+        """
         try:
             return self.model.data.frame
         except AttributeError:
             return None
 
     def _try_get_design_info(self):
+        """Retrieve the patsy DesignInfo from the model, if available.
+
+        Returns
+        -------
+        DesignInfo or None
+            The patsy ``DesignInfo`` object when the model was fit with a
+            formula; ``None`` in raw-exog mode.
+
+        Notes
+        -----
+        In formula mode, the DesignInfo encodes how the data frame maps
+        to the design matrix (interactions, transformations, categorical
+        encodings). In raw mode, ``Margins`` falls back to column-name
+        matching against ``model.exog_names``.
+        """
         exog = getattr(self.model.data, "orig_exog", None)
         if exog is not None and hasattr(exog, "design_info"):
             return exog.design_info
@@ -481,6 +746,18 @@ class Margins:
     def _build_exog(self, frame: pd.DataFrame) -> np.ndarray:
         """Build a numeric design matrix from a data frame.
 
+        Parameters
+        ----------
+        frame : pd.DataFrame
+            Data-space frame containing the required columns.
+
+        Returns
+        -------
+        ndarray
+            Numeric design matrix suitable for ``model.predict``.
+
+        Notes
+        -----
         If the model was fit with a formula, this uses patsy's DesignInfo
         to rebuild the matrix (handling interactions, etc.). If fit with
         raw matrices, it selects columns matching ``model.exog_names``.
@@ -496,12 +773,26 @@ class Margins:
     def _predict(self, params: np.ndarray, exog: np.ndarray) -> np.ndarray:
         """Return E[Y | X] (response scale) using the model's own predict.
 
+        Parameters
+        ----------
+        params : ndarray of shape (p,)
+            Parameter vector override.
+        exog : ndarray of shape (n, p)
+            Design matrix.
+
+        Returns
+        -------
+        ndarray of shape (n,)
+            Predicted values on the response scale.
+
+        Notes
+        -----
         Many StatsModels results accept a ``params`` override to
         ``model.predict``; for GLMs this applies the inverse link. When
         the model carries offset/exposure but the design has a different
         row count than training (e.g. APM/MEM single rows), we broadcast
-        the *mean* training offset/exposure to the new design — otherwise
-        statsmodels can't align the stored length-N offset against the
+        the *mean* training offset/exposure to the new design \u2014 otherwise
+        statsmodels cannot align the stored length-N offset against the
         smaller exog and silently drops it.
         """
         exog_arr = np.asarray(exog)
@@ -525,14 +816,25 @@ class Margins:
     # ---- analytic outer-Jacobian support ----
 
     def _link_deriv(self) -> Optional[Callable[[np.ndarray], np.ndarray]]:
-        """Callable returning :math:`f'(\\eta)`, or ``None`` if FD is required.
+        r"""Return the link derivative :math:`f'(\eta)`, or ``None``.
 
+        Returns a callable ``fprime(eta)`` when an analytic derivative
+        of the inverse link is available; otherwise ``None``, signalling
+        that the caller should fall back to finite differences.
+
+        Returns
+        -------
+        callable or None
+            ``fprime(eta)`` returning :math:`f'(\eta)` element-wise, or
+            ``None`` if the model does not expose an analytic derivative.
+
+        Notes
+        -----
         Eligible when the model exposes ``family.link.inverse_deriv`` (every
         stock GLM family) or is a linear-regression model (identity link).
-        Bails out — returning ``None`` so the caller falls back to FD —
-        whenever an offset or exposure is present, since then
-        :math:`\\eta \\neq X\\beta` and our chain rule would need an
-        offset-aware path we don't currently provide.
+        Bails out returning ``None`` whenever an offset or exposure is
+        present, since then :math:`\eta \neq X\beta` and our chain rule
+        would need an offset-aware path we do not currently provide.
         """
         if not self.analytic:
             return None
@@ -566,12 +868,33 @@ class Margins:
         beta: np.ndarray,
         fprime: Callable[[np.ndarray], np.ndarray],
     ) -> np.ndarray:
-        """:math:`\\partial/\\partial\\beta` of :math:`(1/n)\\sum_i f(x_i^\\top\\beta)`.
+        r"""Gradient of the mean prediction with respect to parameters.
 
-        Returns shape ``(p,)``. Building block for every analytic Jacobian
-        in this module: every statistic we compute is a linear combination
-        of mean-predictions on different design matrices, so each row of
-        the analytic ``J`` is a linear combination of these gradients.
+        Computes
+        :math:`\partial/\partial\beta` of
+        :math:`(1/n)\sum_i f(x_i^\top\beta)`, returning shape ``(p,)``.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n, p)
+            Design matrix.
+        beta : ndarray of shape (p,)
+            Parameter vector.
+        fprime : callable
+            Function returning :math:`f'(\eta)` for each linear
+            predictor value.
+
+        Returns
+        -------
+        ndarray of shape (p,)
+            Gradient vector.
+
+        Notes
+        -----
+        Building block for every analytic Jacobian in this module: every
+        statistic we compute is a linear combination of mean-predictions
+        on different design matrices, so each row of the analytic ``J``
+        is a linear combination of these gradients.
         """
         X = np.asarray(X, dtype=float)
         eta = X @ beta
@@ -593,6 +916,32 @@ class Margins:
         frames: List[pd.DataFrame],
         perturb: Callable[[pd.DataFrame], tuple[pd.DataFrame, pd.DataFrame]],
     ) -> List[tuple[np.ndarray, np.ndarray]]:
+        """Build paired design matrices for a perturbation-based contrast.
+
+        For each input frame, applies ``profile.prepare_frame``, then
+        the perturbation callable, then ``_build_exog``, and optionally
+        design-matrix collapse.
+
+        Parameters
+        ----------
+        profile : _Profile
+            Evaluation profile controlling numerics/design collapse.
+        frames : list of pd.DataFrame
+            Base frames (already expanded via ``_expand_at``).
+        perturb : callable
+            Function ``(pd.DataFrame) -> (fa, fb)`` producing the two
+            perturbed data-space frames for the contrast.
+
+        Returns
+        -------
+        list of tuple
+            List of ``(Xa, Xb)`` design-matrix pairs.
+
+        Notes
+        -----
+        Numerics-collapse runs *before* perturb, so the perturbation
+        (e.g. ``variable + 1``) isn't overwritten by the mean-substitution.
+        """
         # Numerics-collapse runs *before* perturb, so the perturbation
         # (e.g. ``variable + 1``) isn't overwritten by the mean-substitution.
         out: List[tuple[np.ndarray, np.ndarray]] = []
@@ -613,11 +962,21 @@ class Margins:
         scale: float = 1.0,
     ) -> tuple[Callable[[np.ndarray], np.ndarray],
                Optional[Callable[[np.ndarray], np.ndarray]]]:
-        """``E[f(X_a)] - E[f(X_b)]`` per pair, scaled by ``scale``.
+        """Compute ``E[f(X_a)] - E[f(X_b)]`` per pair, scaled by ``scale``.
 
-        Returns ``(statistic, jac)``. ``jac`` is None when no analytic
-        link derivative is available — the caller falls back to FD via
-        ``_central_jacobian``.
+        Parameters
+        ----------
+        pairs : sequence of tuple
+            Each element is ``(Xa, Xb)``, a pair of design matrices.
+        scale : float, default 1.0
+            Multiplicative constant applied to each contrast.
+
+        Returns
+        -------
+        tuple
+            ``(statistic, jac)``. ``jac`` is None when no analytic
+            link derivative is available — the caller falls back to FD via
+            ``_central_jacobian``.
         """
         n = len(pairs)
 
@@ -651,9 +1010,24 @@ class Margins:
     ) -> tuple[List[pd.DataFrame], List[str]]:
         """Cartesian-product expansion of an ``at`` specification.
 
+        Parameters
+        ----------
+        base : pd.DataFrame
+            Base frame (e.g. from ``_single_row`` or the full data).
+        at : mapping, optional
+            Variable name -> scalar or list of scalars.
+
+        Returns
+        -------
+        tuple
+            ``(frames, labels)`` where each frame is ``base`` with the
+            chosen values broadcast, and ``labels`` describe the
+            ``atexog`` combination.
+
+        Notes
+        -----
         ``at`` maps variable names to either scalars or lists of scalars.
-        Returns (frames, labels) where each frame is ``base`` with the
-        chosen values broadcast.
+        Lists are expanded as a cartesian product over all variables.
         """
         if not at:
             return [base.copy()], [""]
@@ -676,6 +1050,21 @@ class Margins:
     def _single_row(self, at: str, factor_stat: str) -> pd.DataFrame:
         """Build a one-row representative frame in data space.
 
+        Parameters
+        ----------
+        at : {"mean", "median", "zero"}
+            Evaluation point for numeric covariates.
+        factor_stat : {"mode", "zero"}
+            How to set factor / categorical columns.
+
+        Returns
+        -------
+        pd.DataFrame
+            One-row data frame with all columns set to their
+            representative values.
+
+        Notes
+        -----
         Numeric columns get the value implied by ``at``
         (mean / median / 0). Factor / categorical columns get the value
         implied by ``factor_stat`` (modal level for ``"mode"``, the patsy
@@ -722,9 +1111,22 @@ class Margins:
     def _factor_reference_level(self, col: str) -> object:
         """Return the patsy reference level for a categorical column.
 
+        Parameters
+        ----------
+        col : str
+            Column name of a categorical variable in the data frame.
+
+        Returns
+        -------
+        object
+            The reference level \u2014 the one that contributes nothing to the
+            linear predictor under default treatment contrasts.
+
+        Notes
+        -----
         Probes one-row designs with ``col`` set to each observed level
         (other variables held at simple defaults) and picks the level
-        whose 1-row design has the minimum L1 norm — i.e. the one that
+        whose 1-row design has the minimum L1 norm \u2014 i.e. the one that
         contributes nothing to the linear predictor under default
         contrasts. This matches the level that ``get_margeff(at='zero')``
         implicitly picks when it sets the design row to zero.
@@ -760,7 +1162,19 @@ class Margins:
         return best_lvl
 
     def _probe_default(self, col: str):
-        """Default probe value: 0 for numerics, first sorted level otherwise."""
+        """Return a default probe value for a column.
+
+        Parameters
+        ----------
+        col : str
+            Column name in ``self.data``.
+
+        Returns
+        -------
+        object
+            ``0.0`` for numeric columns; the alphabetically first observed
+            level otherwise.
+        """
         s = self.data[col]
         if (pd.api.types.is_numeric_dtype(s)
                 and not pd.api.types.is_bool_dtype(s)):
@@ -776,9 +1190,24 @@ class Margins:
     def _resolve_base(self, at: str, factor_stat: str) -> _Profile:
         """Return the evaluation profile for ``(at, factor_stat)``.
 
+        Parameters
+        ----------
+        at : {"overall", "mean", "median", "zero"}
+            Evaluation point for numeric covariates.
+        factor_stat : {"mean", "mode", "zero"}
+            How to handle factor / categorical variables.
+
+        Returns
+        -------
+        _Profile
+            Evaluation profile with ``collapse_design`` and
+            ``collapse_numerics`` flags set appropriately.
+
+        Notes
+        -----
         ``profile.collapse_design`` is True iff factors should end up at
         their observed proportions (Stata ``atmeans`` semantics).
-        ``profile.collapse_numerics`` is always False here — the count
+        ``profile.collapse_numerics`` is always False here \u2014 the count
         and discrete contrast paths flip it on themselves before
         materializing, since they need a single design row in data space
         rather than the design-column averages that the continuous FD
@@ -812,6 +1241,19 @@ class Margins:
     def _collapse_numerics_to_mean(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Replace observed (row-varying) numeric columns with their training mean.
 
+        Parameters
+        ----------
+        frame : pd.DataFrame
+            Data-space frame, possibly containing ``atexog`` overrides.
+
+        Returns
+        -------
+        pd.DataFrame
+            Copy with row-varying numeric columns replaced by their
+            training-sample mean.
+
+        Notes
+        -----
         Used by the count and discrete dydx paths under ``collapse=True``
         to give a single representative profile in *data space*, so that
         derived columns like ``I(x**2)`` evaluate to ``mean(x)**2`` rather
@@ -833,6 +1275,7 @@ class Margins:
 
     @staticmethod
     def _check_at(at: str) -> None:
+        """Validate ``at`` argument, raising if unknown."""
         if at not in ("overall", "mean", "median", "zero"):
             raise ValueError(
                 f"at must be 'overall', 'mean', 'median', or 'zero', "
@@ -841,6 +1284,7 @@ class Margins:
 
     @staticmethod
     def _check_factor_stat(factor_stat: str) -> None:
+        """Validate ``factor_stat`` argument, raising if unknown."""
         if factor_stat not in ("mean", "mode", "zero"):
             raise ValueError(
                 f"factor_stat must be 'mean', 'mode', or 'zero', "
@@ -849,7 +1293,12 @@ class Margins:
 
     @staticmethod
     def _default_factor_stat(at: str) -> str:
-        """Pick a sensible factor_stat when the user didn't supply one."""
+        """Pick a sensible ``factor_stat`` when the user did not supply one.
+
+        Maps ``at`` values to their natural factor handling:
+        ``overall`` -> ``mean``, ``mean`` -> ``mean``, ``median`` -> ``mode``,
+        ``zero`` -> ``zero``.
+        """
         return {
             "overall": "mean",  # ignored — no collapse happens
             "mean":    "mean",  # Stata default: design-matrix proportions
@@ -866,6 +1315,38 @@ class Margins:
         stat_name: str,
         jac: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ) -> MarginsResult:
+        r"""Apply the delta method to a vector-valued statistic.
+
+        Computes :math:`\hat\theta = g(\hat\beta)` and its delta-method
+        covariance :math:`\widehat{\operatorname{Var}}(\hat\theta) = J V J^\top`,
+        where :math:`J = \partial g / \partial \beta` is either supplied
+        analytically or obtained by central finite differences.
+
+        Parameters
+        ----------
+        statistic : callable
+            Function mapping a parameter vector :math:`\beta` to a vector
+            of statistic values.
+        labels : sequence of str
+            Row labels for each component of the statistic.
+        stat_name : str
+            Column name to use in the summary table.
+        jac : callable, optional
+            Function returning the analytic Jacobian matrix
+            :math:`\partial g / \partial \beta`. If ``None``, the Jacobian
+            is computed numerically via ``_central_jacobian``.
+
+        Returns
+        -------
+        MarginsResult
+            Estimates with delta-method standard errors and confidence
+            intervals.
+
+        Notes
+        -----
+        This is the core inference primitive shared by every public API
+        method (``predict``, ``dydx``, ``did``).
+        """
         beta = self.params
         est_val = statistic(beta)
         est = np.atleast_1d(np.asarray(est_val, dtype=float)).ravel()
@@ -883,17 +1364,17 @@ class Margins:
             level=self.level, df=self.df, stat_name=stat_name,
         )
 
-    # ======================================================================
+    # ======================================================================}
     # Public API: adjusted predictions
-    # ======================================================================
+    # ======================================================================}
 
     def predict(
-        self,
-        at: str = "overall",
-        atexog: Optional[Mapping[str, object]] = None,
-        factor_stat: Optional[str] = None,
-    ) -> MarginsResult:
-        """Adjusted predictions (expected outcome on the response scale).
+            self,
+            at: str = "overall",
+            atexog: Optional[Mapping[str, object]] = None,
+            factor_stat: Optional[str] = None,
+        ) -> MarginsResult:
+        r"""Compute adjusted predictions (expected outcome on the response scale).
 
         Parameters
         ----------
@@ -948,6 +1429,30 @@ class Margins:
         APR  (pred. at rep. values)   ``predict(atexog={"x1": [0,1,2]})``
         APR with others at means      ``predict(at="mean", atexog={"x1": [0,1,2]})``
         ============================  ============================================
+
+        Examples
+        --------
+        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+        >>> from smmargins import Margins
+        >>> np.random.seed(0)
+        >>> df = pd.DataFrame({
+        ...     "y": np.random.randn(8),
+        ...     "x1": np.random.randn(8),
+        ...     "x2": np.random.randn(8),
+        ... })
+        >>> fit = smf.ols("y ~ x1 + x2", df).fit()
+        >>> m = Margins(fit)
+        >>> round(float(m.predict().estimate[0]), 6)
+        0.884107
+        >>> round(float(m.predict(at="mean").estimate[0]), 6)
+        0.884107
+       
+     >>> len(m.predict(atexog={"x1": [0, 1]}).estimate)
+     2
+
+        See Also
+        --------
+        Margins.dydx
         """
         self._check_at(at)
         if factor_stat is None:
@@ -988,23 +1493,23 @@ class Margins:
 
         return self._delta(statistic, labels=labels, stat_name=stat_name, jac=jac)
 
-    # ======================================================================
+    # ======================================================================}
     # Public API: marginal effects
-    # ======================================================================
+    # ======================================================================}
 
     def dydx(
-        self,
-        variable: Union[str, List[str]],
-        at: str = "overall",
-        atexog: Optional[Mapping[str, object]] = None,
-        discrete: Optional[bool] = None,
-        count: bool = False,
-        step: Optional[float] = None,
-        reference: Optional[object] = None,
-        factor_stat: Optional[str] = None,
-        method: str = "dydx",
-    ) -> MarginsResult:
-        """Marginal effect of ``variable`` on the response.
+            self,
+            variable: Union[str, List[str]],
+            at: str = "overall",
+            atexog: Optional[Mapping[str, object]] = None,
+            discrete: Optional[bool] = None,
+            count: bool = False,
+            step: Optional[float] = None,
+            reference: Optional[object] = None,
+            factor_stat: Optional[str] = None,
+            method: str = "dydx",
+        ) -> MarginsResult:
+        r"""Marginal effect of ``variable`` on the response.
 
         Parameters
         ----------
@@ -1030,15 +1535,15 @@ class Margins:
         method : {"dydx", "dyex", "eyex", "eydx"}, default ``"dydx"``
             What to compute, per observation, before averaging:
 
-            - ``"dydx"`` : :math:`\\partial y_i / \\partial x_{ij}`
+            - ``"dydx"`` : :math:`\partial y_i / \partial x_{ij}`
               (level change). The default; only path with an analytic
               outer Jacobian.
-            - ``"dyex"`` : :math:`(\\partial y_i / \\partial x_{ij})\\,x_i`
-              (semi-elasticity, :math:`dy/d(\\ln x)`).
-            - ``"eyex"`` : :math:`(\\partial y_i / \\partial x_{ij})\\,x_i / y_i`
+            - ``"dyex"`` : :math:`(\partial y_i / \partial x_{ij})\,x_i`
+              (semi-elasticity, :math:`dy/d(\ln x)`).
+            - ``"eyex"`` : :math:`(\partial y_i / \partial x_{ij})\,x_i / y_i`
               (full elasticity).
-            - ``"eydx"`` : :math:`(\\partial y_i / \\partial x_{ij}) / y_i`
-              (semi-elasticity, :math:`d(\\ln y)/dx`).
+            - ``"eydx"`` : :math:`(\partial y_i / \partial x_{ij}) / y_i`
+              (semi-elasticity, :math:`d(\ln y)/dx`).
 
             Only valid for continuous variables; raises if the variable
             is (auto- or explicitly) discrete and ``method != "dydx"``.
@@ -1048,6 +1553,13 @@ class Margins:
         Returns
         -------
         MarginsResult
+
+        Raises
+        ------
+        ValueError
+            If ``count=True`` and ``discrete=True`` are both passed, if
+            ``count=True`` with ``method != "dydx"``, or if ``method``
+            is not one of the four allowed strings.
 
         Notes
         -----
@@ -1063,6 +1575,42 @@ class Margins:
         All RHS columns               ``dydx("*")``
         With unit increment           ``dydx("kids", count=True)``
         ============================  =====================================
+
+        The Average Marginal Effect (AME) is
+
+        .. math::
+
+            \frac{1}{n}\sum_i \frac{\partial f(x_i^\top\beta)}{\partial x_{ij}},
+
+        where :math:`f` is the inverse link function. The Marginal Effect
+        at Means (MEM) replaces each :math:`x_i` by its sample mean (or
+        the chosen ``at`` profile) before taking the derivative.
+
+        Examples
+        --------
+        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+        >>> from smmargins import Margins
+        >>> np.random.seed(0)
+        >>> df = pd.DataFrame({
+        ...     "y": np.random.randn(8),
+        ...     "x1": np.random.randn(8),
+        ...     "x2": np.random.randn(8),
+        ...     "group": np.repeat(["A", "B"], 4),
+        ... })
+        >>> fit = smf.ols("y ~ x1 + x2 + C(group)", df).fit()
+        >>> m = Margins(fit)
+        >>> round(float(m.dydx("x1").estimate[0]), 6)
+        0.888172
+        >>> len(m.dydx(["x1", "x2"]).estimate)
+        2
+  
+     >>> len(m.dydx("group").estimate)
+     1
+
+        See Also
+        --------
+        Margins.predict
+        Margins.did
         """
         if method not in _METHOD_META:
             raise ValueError(
@@ -1204,6 +1752,7 @@ class Margins:
 
     @staticmethod
     def _continuous_label_suffix(at: str) -> str:
+        """Human-readable suffix for an evaluation profile."""
         return {"overall": "", "mean": " (at means)",
                 "median": " (at medians)", "zero": " (at zero)"}[at]
 
@@ -1211,6 +1760,12 @@ class Margins:
         self, variable: str, method: str, at: str, at_labels: List[str],
         n_frames: int,
     ) -> List[str]:
+        """Build column labels for a continuous marginal effect.
+
+        Labels combine the method prefix (``d`` for ``dydx``/``dyex``,
+        ``e`` for ``eyex``/``eydx``), the variable name, the evaluation
+        profile suffix, and any ``atexog`` label.
+        """
         prefix = _METHOD_META[method]["prefix"]
         if n_frames == 1 and at_labels[0] == "":
             return [f"{prefix}{variable}{self._continuous_label_suffix(at)}"]
@@ -1227,6 +1782,44 @@ class Margins:
         at: str,
         method: str = "dydx",
     ):
+        r"""Build statistic and Jacobian for a continuous derivative marginal effect.
+
+        Uses a central finite-difference step to approximate
+        :math:`\partial y / \partial x`.  For ``method="dydx"`` the paired
+        contrast machinery can be used with an analytic Jacobian; elasticity
+        branches (``dyex``, ``eyex``, ``eydx``) require per-row scaling and
+        fall back to finite differences for the outer Jacobian.
+
+        Parameters
+        ----------
+        variable : str
+            Column name of the continuous covariate.
+        profile : _Profile
+            Evaluation profile controlling numerics/design collapse.
+        frames : list of pd.DataFrame
+            Base frames (already expanded via ``_expand_at``).
+        at_labels : list of str
+            Labels for each ``atexog`` combination.
+        step : float, optional
+            Finite-difference step size. Defaults to
+            :math:`\epsilon^{1/3} \cdot \max(\text{sd}(x), |\bar x|, 1)`.
+        at : str
+            Profile name (``overall``, ``mean``, ``median``, ``zero``).
+        method : {"dydx", "dyex", "eyex", "eydx"}, default "dydx"
+            Transform applied to the raw derivative before averaging.
+
+        Returns
+        -------
+        tuple
+            ``(statistic, jac, labels, stat_name)`` suitable for ``_delta``.
+
+        Notes
+        -----
+        ``method="dydx"`` is the only path that admits an analytic outer
+        Jacobian (via ``_paired_contrast``).  Elasticity methods need
+        per-row :math:`x_i` and :math:`y_i` values, so the Jacobian is
+        always obtained by finite differences.
+        """
         if step is None:
             sd = float(self.data[variable].std(ddof=0))
             scale = max(sd, abs(float(self.data[variable].mean())), 1.0)
@@ -1297,6 +1890,35 @@ class Margins:
         frames: List[pd.DataFrame],
         at_labels: List[str],
     ):
+        r"""Build statistic and Jacobian for a count (unit increment) marginal effect.
+
+        Computes :math:`E[f(X \mid x+1)] - E[f(X \mid x)]` via paired
+        contrasts, treating ``variable`` as an integer-valued covariate.
+
+        Parameters
+        ----------
+        variable : str
+            Column name of the integer-valued covariate.
+        profile : _Profile
+            Evaluation profile controlling design collapse.
+        frames : list of pd.DataFrame
+            Base frames (already expanded via ``_expand_at``).
+        at_labels : list of str
+            Labels for each ``atexog`` combination.
+
+        Returns
+        -------
+        tuple
+            ``(statistic, jac, labels, stat_name)`` suitable for ``_delta``.
+
+        Notes
+        -----
+        When ``collapse_design`` is active, we also ``collapse_numerics`` so
+        derived columns like ``I(x**2)`` evaluate to ``mean(x)**2`` rather
+        than ``mean(x**2)``. The continuous-FD path does not need this
+        because its :math:`O(h^2)` truncation error vanishes; the unit
+        increment does not.
+        """
         # Under ``collapse_design`` we also collapse_numerics, so that
         # I(x**2)-style derived columns evaluate to mean(x)**2 rather than
         # mean(x**2) — i.e. the contrast becomes f(η at mean+1) − f(η at
@@ -1328,6 +1950,37 @@ class Margins:
         at_labels: List[str],
         reference: Optional[object],
     ):
+        r"""Build statistic and Jacobian for discrete contrasts of a factor variable.
+
+        For each non-reference level, compute
+        :math:`E[f(X \mid \text{level})] - E[f(X \mid \text{reference})]`
+        via paired contrasts.
+
+        Parameters
+        ----------
+        variable : str
+            Factor column name in the data frame.
+        profile : _Profile
+            Evaluation profile controlling design collapse.
+        frames : list of pd.DataFrame
+            Base frames (already expanded via ``_expand_at``).
+        at_labels : list of str
+            Labels for each ``atexog`` combination.
+        reference : object, optional
+            Reference level to contrast against. Defaults to the smallest
+            observed level.
+
+        Returns
+        -------
+        tuple
+            ``(statistic, jac, labels, stat_name)`` suitable for ``_delta``.
+
+        Notes
+        -----
+        Enables ``collapse_numerics`` when ``collapse_design`` is active so
+        that derived columns (e.g. ``I(x**2)``) evaluate at the mean before
+        the level substitution, matching Stata semantics.
+        """
         # See ``_dydx_count_components`` for why we collapse numerics here.
         profile = _Profile(
             frame=profile.frame,
@@ -1364,9 +2017,9 @@ class Margins:
         statistic, jac = self._paired_contrast(pairs)
         return (statistic, jac, labels, "contrast")
 
-    # ======================================================================
+    # ======================================================================}
     # Public API: difference-in-differences
-    # ======================================================================
+    # ======================================================================}
 
     def did(
         self,
@@ -1378,7 +2031,7 @@ class Margins:
         atexog: Optional[Mapping[str, object]] = None,
         factor_stat: Optional[str] = None,
     ) -> "DiDResult":
-        """Difference-in-differences on the response scale.
+        r"""Difference-in-differences on the response scale.
 
         Sets up a 2×2 grid (``group`` × ``condition``), computes adjusted
         predictions for all four cells (averaging over other covariates
@@ -1412,6 +2065,40 @@ class Margins:
         that's exactly the Ai & Norton (2003) issue, and why a
         response-scale DiD with a delta-method SE is the right thing to
         report.
+
+        Examples
+        --------
+        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+        >>> from smmargins import Margins
+        >>> np.random.seed(0)
+        >>> df = pd.DataFrame({
+        ...     "y": np.random.randn(10),
+        ...     "treat": np.repeat([0, 1], 5),
+        ...     "post": np.tile([0, 1], 5),
+        ... })
+        >>> fit = smf.ols("y ~ treat * post", df).fit()
+        >>> m = Margins(fit)
+        >>> did = m.did("treat", "post")
+        >>> len(did.cells.estimate)
+        4
+        >>> did.did.estimate.size
+        1
+        >>> bool(did.did.se[0] > 0)
+        True
+
+        References
+        ----------
+        [1] Ai, C., & Norton, E. C. (2003). Interaction terms in logit
+           and probit models. *Economics Letters*, 80(1), 123–129.
+           https://doi.org/10.1016/S0165-1765(03)00032-6
+        [2] Williams, R. (2012). Using the margins command to estimate
+           and interpret adjusted predictions and marginal effects.
+           *Stata Journal*, 12(2), 308–331.
+
+        See Also
+        --------
+        MarginsResult.contrast
+        DiDResult
         """
         g = (list(group_levels) if group_levels is not None
              else self._default_two_levels(group))
@@ -1478,6 +2165,23 @@ class Margins:
                          joint=all_contrasts)
 
     def _default_two_levels(self, col: str) -> list:
+        """Return the two most extreme unique levels of a column.
+
+        Parameters
+        ----------
+        col : str
+            Column name in ``self.data``.
+
+        Returns
+        -------
+        list
+            A two-element list ``[smallest, largest]`` of observed levels.
+
+        Raises
+        ------
+        ValueError
+            If the column has fewer than 2 unique values.
+        """
         vals = self.data[col].dropna().unique().tolist()
         try:
             vals = sorted(vals)
@@ -1496,9 +2200,13 @@ class Margins:
 # ---------------------------------------------------------------------------
 
 class DiDResult:
-    """Bundle of results from :meth:`Margins.did`.
+    r"""Bundle of results from :meth:`Margins.did`.
 
-    Attributes
+    Holds the four cell predictions, the two simple effects, the
+    difference-in-differences estimate, and a joint result that contains
+    all three contrasts with their shared covariance.
+
+    Parameters
     ----------
     cells : MarginsResult
         The four adjusted predictions.
@@ -1508,7 +2216,42 @@ class DiDResult:
         The single difference-in-differences estimate.
     joint : MarginsResult
         All three contrasts (2 simple effects + DiD) sharing joint vcov,
-        useful if you want to jointly test e.g. ``simple_effects = did = 0``.
+        useful if you want to jointly test e.g.
+        ``simple_effects = did = 0``.
+
+    Attributes
+    ----------
+    cells : MarginsResult
+    simple_effects : MarginsResult
+    did : MarginsResult
+    joint : MarginsResult
+
+    Examples
+    --------
+    >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+    >>> from smmargins import Margins
+    >>> np.random.seed(0)
+    >>> df = pd.DataFrame({
+    ...     "y": np.random.randn(10),
+    ...     "treat": np.repeat([0, 1], 5),
+    ...     "post": np.tile([0, 1], 5),
+    ... })
+    >>> fit = smf.ols("y ~ treat * post", df).fit()
+   
+    >>> did = Margins(fit).did("treat", "post")
+    >>> len(did.cells.estimate)
+    4
+    >>> int(did.did.estimate.size)
+    1
+    >>> bool(did.did.se[0] > 0)
+    True
+    >>> did.joint.summary()
+                                 estimate   std.err  ...  [95% CI lo]  [95% CI hi]
+    treat: 1 vs 0 | post=0      -1.113348  0.716480  ...    -2.517623     0.290927
+    treat: 1 vs 0 | post=1      -1.559871  0.716480  ...    -2.964146    -0.155596
+    DiD: treat(1-0) × post(1-0) -0.446523  1.013256  ...    -2.432467     1.539422
+    <BLANKLINE>
+    [3 rows x 6 columns]
     """
 
     def __init__(self, cells: MarginsResult, simple_effects: MarginsResult,
@@ -1519,7 +2262,32 @@ class DiDResult:
         self.joint = joint
 
     def summary(self) -> pd.DataFrame:
-        """Return the full DiD summary as one concatenated DataFrame."""
+        r"""Return the full DiD summary as one concatenated DataFrame.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Vertically concatenated summaries of ``cells``, ``simple_effects``,
+            and ``did``, with an extra column indicating the block
+            (``"cell"``, ``"simple"``, ``"DiD"``).
+
+        Examples
+        --------
+        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+        >>> from smmargins import Margins
+        >>> np.random.seed(0)
+        >>> df = pd.DataFrame({
+        ...     "y": np.random.randn(10),
+        ...     "treat": np.repeat([0, 1], 5),
+        ...     "post": np.tile([0, 1], 5),
+        ... })
+        >>> fit = smf.ols("y ~ treat * post", df).fit()
+        >>> did = Margins(fit).did("treat", "post")
+        >>> isinstance(did.summary(), pd.DataFrame)
+        True
+        >>> len(did.summary())
+        7
+        """
         parts = [
             self.cells.summary().assign(**{"": "cell"}),
             self.simple_effects.summary().assign(**{"": "simple"}),
@@ -1528,6 +2296,7 @@ class DiDResult:
         return pd.concat(parts)
 
     def __repr__(self) -> str:
+        """Return a formatted string with cell predictions, simple effects, and DiD."""
         def banner(title: str) -> str:
             return "\n" + title + "\n" + "-" * len(title)
         return "\n".join([
