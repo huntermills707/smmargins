@@ -2,7 +2,7 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath('..'))
 
-project = 'marginal_effects'
+project = 'smmargins'
 copyright = '2026'
 author = ''
 release = '0.1.0'
@@ -29,4 +29,5 @@ intersphinx_mapping = {
 }
 
 html_theme = 'alabaster'
-html_static_path = []
+html_static_path = ['_static']
+html_css_files = ['custom.css']

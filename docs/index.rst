@@ -1,4 +1,4 @@
-marginal_effects
+smmargins
 ================
 
 .. automodule:: smmargins
