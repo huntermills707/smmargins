@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
 
-from marginal_effects import Margins
+from smmargins import Margins
 
 pd.options.display.width = 120
 pd.options.display.float_format = "{: .4f}".format
