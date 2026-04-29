@@ -1,4 +1,4 @@
-# `marginal_effects` — Stata-style `margins` for StatsModels
+# `smmargins` — Stata-style `margins` for StatsModels
 
 A small module that fills in the marginal-effects gaps in StatsModels:
 adjusted predictions and marginal effects at user-specified covariate
@@ -69,7 +69,7 @@ not the design matrix.
 ## API
 
 ```python
-from marginal_effects import Margins
+from smmargins import Margins
 
 M = Margins(fit)                 # fit is a statsmodels results object
 
@@ -249,7 +249,7 @@ read it off the interaction coefficient. `test_did.py` verifies:
 
 ## Files
 
-- `marginal_effects.py` — the module.
+- `smmargins.py` — the module.
 - `test_margins.py`    — correctness tests for predictions and marginal effects.
 - `test_did.py`        — correctness tests for DiD and contrasts.
 - `demo_margins.py`    — Williams-style walkthrough on a simulated dataset.
