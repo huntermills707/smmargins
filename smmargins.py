@@ -45,16 +45,33 @@ correctly and automatically.
 
 Examples
 --------
->>> import numpy as np, pandas as pd
->>> import statsmodels.formula.api as smf
->>> from smmargins import Margins
->>> df = pd.DataFrame({"y": [1, 2, 3], "x1": [1, 2, 3], "x2": [3, 2, 1]})
->>> fit = smf.ols("y ~ x1 + x2", data=df).fit()
->>> M = Margins(fit)
->>> round(float(M.predict().estimate[0]), 6)
-2.0
->>> float(M.dydx("x1").estimate[0])
-0.944...
+Fit a logit, then ask for the average marginal effect of ``age`` and the
+adjusted-prediction profile across ``age`` for each sex::
+
+    import numpy as np, pandas as pd
+    import statsmodels.formula.api as smf
+    from smmargins import Margins
+
+    fit = smf.logit("voted ~ age + income + C(educ) + female + age:female",
+                    data=df).fit()
+    M = Margins(fit)
+
+    M.dydx("age")                                  # AME of age
+    M.dydx("age", at="mean")                       # MEM
+    M.dydx("age", atexog={"female": [0, 1]})       # MER, by sex
+    M.predict(atexog={"age": list(range(20, 91, 10)),
+                      "female": [0, 1]})           # plottable table
+
+For a 2x2 difference-in-differences on the response (probability) scale::
+
+    res = M.did("group", "preexist_Y",
+                group_levels=["A", "B"], condition_levels=[0, 1],
+                atexog={"age": 60, "female": 0})
+    print(res)            # cells, simple effects, DiD
+    res.did.estimate      # the DiD point estimate
+    res.cells.vcov        # 4x4 joint covariance of the cell predictions
+
+See ``demo_margins.py`` and ``demo_did.py`` for end-to-end walkthroughs.
 """
 
 from __future__ import annotations
@@ -231,21 +248,41 @@ class MarginsResult:
 
     Examples
     --------
-    >>> import numpy as np
-    >>> from smmargins import MarginsResult
-    >>> est = np.array([1.0, 2.0])
-    >>> vcov = np.array([[0.25, 0.1], [0.1, 0.16]])
-    >>> res = MarginsResult(est, vcov, labels=["m1", "m2"])
-    >>> float(res.estimate[0])
-    1.0
-    >>> float(res.se[0])
-    0.5
-    >>> float(res.estimate[1])
-    2.0
+    Most users obtain a ``MarginsResult`` by calling ``Margins.predict`` or
+    ``Margins.dydx`` rather than constructing one directly. Once you have
+    a result, the typical workflow is to inspect ``.summary()`` or pull
+    fields off it::
+
+        res = M.dydx(["x1", "x2"])
+        res.summary()                # tidy table of estimates / SE / CI
+        res.estimate                 # ndarray of point estimates
+        res.vcov                     # joint delta-method covariance
+
+    Forming linear contrasts of the estimates uses the *joint* covariance
+    that is already on the result, so no additional differentiation is
+    required. For example, the difference between the AMEs of ``x1`` and
+    ``x2``::
+
+        res.contrast([1.0, -1.0], labels=["x1 - x2"])
+
+    Constructing one directly (mostly useful in tests)::
+
+        >>> import numpy as np
+        >>> from smmargins import MarginsResult
+        >>> est = np.array([1.0, 2.0])
+        >>> vcov = np.array([[0.25, 0.10],
+        ...                  [0.10, 0.16]])
+        >>> res = MarginsResult(est, vcov, labels=["m1", "m2"])
+        >>> res.se.round(2).tolist()
+        [0.5, 0.4]
+        >>> res.contrast([1.0, -1.0], labels=["m1 - m2"]).estimate.tolist()
+        [-1.0]
 
     See Also
     --------
-    Margins
+    Margins.predict
+    Margins.dydx
+    Margins.did
     """
 
     def __init__(
@@ -319,19 +356,39 @@ class MarginsResult:
 
         Examples
         --------
-        Simple effect of ``treat`` at ``post=1``, from a 4-cell
-        (treat × post) prediction ordered (0,0), (0,1), (1,0), (1,1)::
+        Suppose ``cells`` holds the four adjusted predictions of a 2x2
+        ``treat`` x ``post`` DiD, ordered as ``(0,0)``, ``(0,1)``,
+        ``(1,0)``, ``(1,1)``. The simple effect of ``treat`` at
+        ``post=1``, with delta-method SE::
 
-            cells.contrast([0, -1, 0, 1], labels=["treat effect | post=1"])
+            cells.contrast([0, -1, 0, 1], labels=["treat | post=1"])
 
-        All three contrasts at once, preserving their joint covariance::
+        Stack three related contrasts so that you keep their joint
+        covariance (useful for joint Wald tests)::
 
-            cells.contrast(
-                [[-1, 0, 1, 0],     # treat effect at post=0
-                 [ 0,-1, 0, 1],     # treat effect at post=1
+            joint = cells.contrast(
+                [[-1, 0, 1, 0],     # simple effect of treat at post=0
+                 [ 0,-1, 0, 1],     # simple effect of treat at post=1
                  [ 1,-1,-1, 1]],    # DiD
                 labels=["simple @post=0", "simple @post=1", "DiD"],
             )
+            joint.summary()
+            joint.vcov              # 3x3 — covariances across the three rows
+
+        A runnable smoke test from synthetic estimates::
+
+            >>> import numpy as np
+            >>> from smmargins import MarginsResult
+            >>> cells = MarginsResult(
+            ...     estimate=np.array([0.10, 0.20, 0.18, 0.40]),
+            ...     vcov=0.001 * np.eye(4),
+            ...     labels=["t=0,p=0", "t=0,p=1", "t=1,p=0", "t=1,p=1"],
+            ... )
+            >>> did = cells.contrast([1, -1, -1, 1], labels=["DiD"])
+            >>> float(did.estimate[0])
+            0.12
+            >>> round(float(did.se[0]), 4)
+            0.0632
 
         References
         ----------
@@ -383,11 +440,21 @@ class MarginsResult:
         --------
         >>> import numpy as np
         >>> from smmargins import MarginsResult
-        >>> est = np.array([2.0])
-        >>> vcov = np.array([[0.04]])
-        >>> MarginsResult(est, vcov, labels=["b"]).summary()
-           margin  std.err     z  P>|z|  [95% CI lo]  [95% CI hi]
-        b     2.0      0.2  10.0    0.0     1.608007     2.391993
+        >>> tbl = MarginsResult(
+        ...     estimate=np.array([2.0]),
+        ...     vcov=np.array([[0.04]]),
+        ...     labels=["b"],
+        ... ).summary()
+        >>> list(tbl.columns)
+        ['margin', 'std.err', 'z', 'P>|z|', '[95% CI lo]', '[95% CI hi]']
+        >>> float(tbl.loc["b", "std.err"])
+        0.2
+        >>> float(tbl.loc["b", "z"])
+        10.0
+
+        For results that came from :class:`Margins`, ``summary()`` is what
+        ``__repr__`` prints — so ``print(M.dydx("x1"))`` already gives you
+        the same table.
         """
         tn = self._test_name
         pct = int(round(self.level * 100))
@@ -559,21 +626,55 @@ class Margins:
 
     Examples
     --------
-    >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-    >>> from smmargins import Margins
-    >>> np.random.seed(0)
-    >>> df = pd.DataFrame({
-    ...     "y": np.random.randn(8),
-    ...     "x1": np.random.randn(8),
-    ...     "x2": np.random.randn(8),
-    ...     "group": np.repeat(["A", "B"], 4),
-    ... })
-    >>> fit = smf.ols("y ~ x1 + x2 + C(group)", df).fit()
-    >>> m = Margins(fit)
-    >>> bool(m.predict().estimate[0] > 0)
-    True
-    >>> float(m.dydx("x1").estimate[0])
-    0.888...
+    A logit with a categorical and an interaction, which would be awkward
+    to differentiate by hand::
+
+        import statsmodels.formula.api as smf
+        from smmargins import Margins
+
+        fit = smf.logit(
+            "voted ~ age + income + C(educ) + female + age:female",
+            data=df,
+        ).fit()
+        M = Margins(fit)
+
+    Adjusted predictions::
+
+        M.predict()                                # AAP
+        M.predict(at="mean")                       # APM
+        M.predict(atexog={"age": [25, 45, 65]})    # APR
+
+    Marginal effects on the response (probability) scale::
+
+        M.dydx("age")                              # AME
+        M.dydx("age", at="mean")                   # MEM
+        M.dydx("age", atexog={"female": [0, 1]})   # MER, by sex
+        M.dydx("educ", reference="college")        # discrete contrasts
+        M.dydx("kids", count=True)                 # x -> x+1 for integers
+        M.dydx("age", method="eyex")               # full elasticity
+
+    Most calls return a :class:`MarginsResult` whose ``__repr__`` prints
+    a tidy table of estimates, SEs, z- (or t-) statistics, p-values, and
+    confidence intervals.
+
+    A small runnable smoke test::
+
+        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+        >>> from smmargins import Margins
+        >>> rng = np.random.default_rng(0)
+        >>> df = pd.DataFrame({
+        ...     "x": rng.standard_normal(200),
+        ...     "g": rng.choice(["A", "B"], 200),
+        ... })
+        >>> df["y"] = 1.0 + 2.0 * df["x"] + (df["g"] == "B") + rng.standard_normal(200)
+        >>> fit = smf.ols("y ~ x + C(g)", df).fit()
+        >>> M = Margins(fit)
+        >>> aap = M.predict()
+        >>> ame = M.dydx("x")
+        >>> aap.estimate.shape, ame.estimate.shape
+        ((1,), (1,))
+        >>> bool(abs(ame.estimate[0] - 2.0) < 0.2)        # close to truth
+        True
 
     References
     ----------
@@ -1432,27 +1533,43 @@ class Margins:
 
         Examples
         --------
-        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-        >>> from smmargins import Margins
-        >>> np.random.seed(0)
-        >>> df = pd.DataFrame({
-        ...     "y": np.random.randn(8),
-        ...     "x1": np.random.randn(8),
-        ...     "x2": np.random.randn(8),
-        ... })
-        >>> fit = smf.ols("y ~ x1 + x2", df).fit()
-        >>> m = Margins(fit)
-        >>> round(float(m.predict().estimate[0]), 6)
-        0.884107
-        >>> round(float(m.predict(at="mean").estimate[0]), 6)
-        0.884107
-       
-     >>> len(m.predict(atexog={"x1": [0, 1]}).estimate)
-     2
+        Adjusted-prediction profile across ``age`` for each sex::
+
+            M.predict(atexog={"age": list(range(20, 91, 10)),
+                              "female": [0, 1]})
+
+        APM (Stata's ``margins, atmeans``) versus AAP::
+
+            M.predict(at="mean")    # factor dummies as observed proportions
+            M.predict()             # AAP — usually the more defensible default
+
+        Hold ``age`` at three policy-relevant values, average everything else
+        over the sample (Stata's ``margins, at(age=(25 45 65))``)::
+
+            M.predict(atexog={"age": [25, 45, 65]})
+
+        A runnable smoke test on a small linear model::
+
+            >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+            >>> from smmargins import Margins
+            >>> rng = np.random.default_rng(0)
+            >>> df = pd.DataFrame({
+            ...     "x1": rng.standard_normal(50),
+            ...     "x2": rng.standard_normal(50),
+            ... })
+            >>> df["y"] = 1.0 + 2.0 * df["x1"] - df["x2"] + 0.1 * rng.standard_normal(50)
+            >>> fit = smf.ols("y ~ x1 + x2", df).fit()
+            >>> M = Margins(fit)
+            >>> M.predict(atexog={"x1": [0, 1]}).estimate.shape
+            (2,)
+            >>> bool(M.predict(atexog={"x1": [0, 1]}).estimate[1]
+            ...      > M.predict(atexog={"x1": [0]}).estimate[0])
+            True
 
         See Also
         --------
         Margins.dydx
+        Margins.did
         """
         self._check_at(at)
         if factor_stat is None:
@@ -1588,24 +1705,52 @@ class Margins:
 
         Examples
         --------
-        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-        >>> from smmargins import Margins
-        >>> np.random.seed(0)
-        >>> df = pd.DataFrame({
-        ...     "y": np.random.randn(8),
-        ...     "x1": np.random.randn(8),
-        ...     "x2": np.random.randn(8),
-        ...     "group": np.repeat(["A", "B"], 4),
-        ... })
-        >>> fit = smf.ols("y ~ x1 + x2 + C(group)", df).fit()
-        >>> m = Margins(fit)
-        >>> round(float(m.dydx("x1").estimate[0]), 6)
-        0.888172
-        >>> len(m.dydx(["x1", "x2"]).estimate)
-        2
-  
-     >>> len(m.dydx("group").estimate)
-     1
+        AME, MEM, and MER for a continuous covariate::
+
+            M.dydx("age")                              # AME
+            M.dydx("age", at="mean")                   # MEM
+            M.dydx("age", atexog={"female": [0, 1]})   # MER — AME by sex
+
+        Multiple variables at once (one row per variable, joint covariance
+        on the result so ``contrast()`` can mix them safely)::
+
+            M.dydx(["age", "income"])
+            M.dydx("*")                                # everything
+
+        Discrete cases. Booleans, strings, and numerics with <=2 unique
+        values are auto-detected; you can override with ``discrete=`` or
+        ``count=``::
+
+            M.dydx("female")                           # 0/1, auto-discrete
+            M.dydx("educ", reference="college")        # contrasts vs reference
+            M.dydx("kids", count=True)                 # unit increment x -> x+1
+
+        Elasticities (continuous variables only)::
+
+            M.dydx("income", method="eyex")            # ey/ex (full elasticity)
+            M.dydx("income", method="dyex")            # dy/ex
+            M.dydx("income", method="eydx")            # ey/dx
+
+        A runnable smoke test on a small linear model where the AME of
+        ``x1`` is exactly :math:`\beta_1`::
+
+            >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+            >>> from smmargins import Margins
+            >>> rng = np.random.default_rng(0)
+            >>> df = pd.DataFrame({
+            ...     "x1": rng.standard_normal(200),
+            ...     "x2": rng.standard_normal(200),
+            ... })
+            >>> df["y"] = 1.0 + 2.0 * df["x1"] - df["x2"] + 0.1 * rng.standard_normal(200)
+            >>> fit = smf.ols("y ~ x1 + x2", df).fit()
+            >>> M = Margins(fit)
+            >>> ame = M.dydx("x1")
+            >>> ame.estimate.shape
+            (1,)
+            >>> bool(abs(ame.estimate[0] - 2.0) < 0.05)
+            True
+            >>> M.dydx(["x1", "x2"]).estimate.shape
+            (2,)
 
         See Also
         --------
@@ -2068,23 +2213,46 @@ class Margins:
 
         Examples
         --------
-        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-        >>> from smmargins import Margins
-        >>> np.random.seed(0)
-        >>> df = pd.DataFrame({
-        ...     "y": np.random.randn(10),
-        ...     "treat": np.repeat([0, 1], 5),
-        ...     "post": np.tile([0, 1], 5),
-        ... })
-        >>> fit = smf.ols("y ~ treat * post", df).fit()
-        >>> m = Margins(fit)
-        >>> did = m.did("treat", "post")
-        >>> len(did.cells.estimate)
-        4
-        >>> did.did.estimate.size
-        1
-        >>> bool(did.did.se[0] > 0)
-        True
+        Healthcare-style 2x2: does the rate of condition X differ between
+        groups A/B, and does that gap depend on a preexisting condition
+        Y? Average over the rest of the covariate distribution::
+
+            M = Margins(fit)
+            res = M.did("group", "preexist_Y",
+                        group_levels=["A", "B"], condition_levels=[0, 1])
+            print(res)                # 4 cells, 2 simple effects, 1 DiD
+            res.did.estimate          # the DiD point estimate
+            res.did.ci_lower          # 95% lower CI
+            res.cells.vcov            # 4x4 joint covariance of the cells
+
+        Same DiD but at one specific patient profile::
+
+            M.did("group", "preexist_Y",
+                  group_levels=["A", "B"], condition_levels=[0, 1],
+                  atexog={"age": 60, "female": 0})
+
+        Sanity check on a linear model — the DiD on the response scale
+        should equal the coefficient on the ``treat:post`` interaction
+        (it does **not** for nonlinear links; see the Notes)::
+
+            >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+            >>> from smmargins import Margins
+            >>> rng = np.random.default_rng(0)
+            >>> n = 400
+            >>> df = pd.DataFrame({
+            ...     "treat": rng.integers(0, 2, n),
+            ...     "post":  rng.integers(0, 2, n),
+            ... })
+            >>> df["y"] = (1.0 + 0.5 * df["treat"] + 0.3 * df["post"]
+            ...            + 0.7 * df["treat"] * df["post"]
+            ...            + 0.1 * rng.standard_normal(n))
+            >>> fit = smf.ols("y ~ treat * post", df).fit()
+            >>> res = Margins(fit).did("treat", "post")
+            >>> res.cells.estimate.shape
+            (4,)
+            >>> bool(abs(res.did.estimate[0]
+            ...          - fit.params["treat:post"]) < 1e-10)
+            True
 
         References
         ----------
@@ -2228,30 +2396,36 @@ class DiDResult:
 
     Examples
     --------
-    >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-    >>> from smmargins import Margins
-    >>> np.random.seed(0)
-    >>> df = pd.DataFrame({
-    ...     "y": np.random.randn(10),
-    ...     "treat": np.repeat([0, 1], 5),
-    ...     "post": np.tile([0, 1], 5),
-    ... })
-    >>> fit = smf.ols("y ~ treat * post", df).fit()
-   
-    >>> did = Margins(fit).did("treat", "post")
-    >>> len(did.cells.estimate)
-    4
-    >>> int(did.did.estimate.size)
-    1
-    >>> bool(did.did.se[0] > 0)
-    True
-    >>> did.joint.summary()
-                                 estimate   std.err  ...  [95% CI lo]  [95% CI hi]
-    treat: 1 vs 0 | post=0      -1.113348  0.716480  ...    -2.517623     0.290927
-    treat: 1 vs 0 | post=1      -1.559871  0.716480  ...    -2.964146    -0.155596
-    DiD: treat(1-0) × post(1-0) -0.446523  1.013256  ...    -2.432467     1.539422
-    <BLANKLINE>
-    [3 rows x 6 columns]
+    Use the bundle to grab whichever piece you want::
+
+        res = M.did("group", "preexist_Y",
+                    group_levels=["A", "B"], condition_levels=[0, 1])
+        print(res)                          # full report (cells + effects + DiD)
+        res.cells.summary()                 # 4-row table for plotting
+        res.simple_effects.estimate         # 2 group-effects, one per Y level
+        res.did.estimate                    # the single DiD on the response scale
+        res.joint.vcov                      # 3x3 covariance for joint Wald tests
+
+    Runnable smoke test::
+
+        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
+        >>> from smmargins import Margins
+        >>> rng = np.random.default_rng(0)
+        >>> df = pd.DataFrame({
+        ...     "treat": rng.integers(0, 2, 200),
+        ...     "post":  rng.integers(0, 2, 200),
+        ... })
+        >>> df["y"] = (df["treat"] + df["post"] + 0.5 * df["treat"] * df["post"]
+        ...            + rng.standard_normal(200))
+        >>> res = Margins(smf.ols("y ~ treat * post", df).fit()).did("treat", "post")
+        >>> res.cells.estimate.shape
+        (4,)
+        >>> res.simple_effects.estimate.shape
+        (2,)
+        >>> res.did.estimate.shape
+        (1,)
+        >>> res.joint.vcov.shape
+        (3, 3)
     """
 
     def __init__(self, cells: MarginsResult, simple_effects: MarginsResult,
