@@ -38,6 +38,16 @@ StatsModels ships ``Results.get_margeff``, but it is limited:
 - :meth:`~smmargins.MarginsResult.contrast` — exact linear combinations
   of any result, reusing the joint covariance.
 
+Installation
+------------
+
+::
+
+    pip install smmargins
+
+Requires Python ≥3.9. Dependencies (``numpy``, ``pandas``, ``statsmodels``,
+``scipy``, ``patsy``) are installed automatically.
+
 Quickstart
 ----------
 

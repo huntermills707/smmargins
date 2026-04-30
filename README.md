@@ -5,6 +5,14 @@ adjusted predictions and marginal effects at user-specified covariate
 profiles, with delta-method standard errors, for *any* fitted model that
 exposes `params`, `cov_params()`, and a `predict(params, exog)` method.
 
+## Installation
+
+```bash
+pip install smmargins
+```
+
+Requires Python ≥3.9. Dependencies (`numpy`, `pandas`, `statsmodels`, `scipy`, `patsy`) are installed automatically.
+
 ## Math
 
 The delta method: for a parameter vector $\hat\beta$ with estimated
@@ -246,6 +254,10 @@ read it off the interaction coefficient. `test_did.py` verifies:
   interaction coefficient (e.g. −0.676 on log-odds vs −0.147 on
   probability in one test run), and matches a by-hand four-cell
   computation to 1e-10.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Files
 
