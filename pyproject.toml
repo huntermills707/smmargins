@@ -2,10 +2,24 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+py-modules = ["smmargins"]
+
 [project]
 name = "smmargins"
 version = "0.1.0"
-description = "Marginal effects for statsmodels"
+description = "Marginal effects for StatsModels"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Hunter Mills", email = "hunter.mills@pm.me" }]
+requires-python = ">=3.9"
+dependencies = ["numpy", "pandas", "statsmodels", "scipy", "patsy"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+]
 
-[tool.setuptools]
-py-modules = ["smmargins"]
+[project.urls]
+Homepage = "https://github.com/huntermills707/smmargins"
+  Documentation = "https://smmargins.readthedocs.io/en/latest/index.html"
