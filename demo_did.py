@@ -124,7 +124,7 @@ print(f"Difference-in-differences                   : "
 print(f"  -> the B-vs-A gap is {abs(did_est):.3%} larger among patients "
       f"with preexisting Y.")
 print(f"  -> 95% CI: ({did.did.ci_lower[0]:+.3%}, {did.did.ci_upper[0]:+.3%})")
-print(f"  -> p-value: {did.did.pvalue[0]:.4g}")
+print(f"  -> p-value: {did.did.pvalues[0]:.4g}")
 
 # ---------------------------------------------------------------------------
 # Sensitivity: DiD at a specific patient profile (e.g. 60-year-old male)

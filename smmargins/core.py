@@ -1,572 +1,16 @@
-r"""
-Stata-style ``margins`` for StatsModels with delta-method standard errors.
-
-For a fitted model with parameter vector :math:`\hat\beta`, estimated
-covariance :math:`\widehat V(\hat\beta)`, and a (possibly vector-valued)
-statistic :math:`g(\beta)`, the delta method gives
-
-.. math::
-
-    \widehat{\operatorname{Var}}\bigl[g(\hat\beta)\bigr]
-    \;\approx\; G\,\widehat V\,G^\top,
-    \qquad
-    G = \left.\frac{\partial g}{\partial \beta}\right|_{\hat\beta}.
-
-Statistics
-----------
-
-This module supports every statistic discussed in Richard Williams'
-*Using the margins command* notes (Margins01):
-
-=========  ========================================================
-AAP        :math:`(1/n)\sum_i f(x_i^\top\beta)`  (avg adj. prediction)
-APM        :math:`f(\bar x^\top\beta)`  (prediction at means)
-APR        AAP with some :math:`x` fixed at representative values
-AME        :math:`(1/n)\sum_i \partial f(x_i^\top\beta)/\partial x_{ij}`
-MEM        :math:`\partial f(\bar x^\top\beta)/\partial x_j`  (ME at means)
-MER        AME with some :math:`x` held at representative values
-=========  ========================================================
-
-where :math:`f` is the response-scale map (identity for OLS, inverse
-link for GLMs, etc.).
-
-Patsy integration
------------------
-
-Rather than hand-differentiating each model's link / linear-predictor
-combination, we build every statistic as a function of :math:`\beta`
-using StatsModels' own ``model.predict(params, exog)``.  Patsy does the
-heavy lifting of propagating perturbations through interactions,
-polynomials, splines, and categorical encodings: when the user says
-"perturb ``x1``", we perturb the *column of the data frame* and let
-``patsy.dmatrix(design_info, ...)`` rebuild the design matrix.  This
-way ``I(x1**2)``, ``x1:x2``, ``C(group)``, ``bs(x1, df=4)`` all update
-correctly and automatically.
-
-Examples
---------
-Fit a logit, then ask for the average marginal effect of ``age`` and the
-adjusted-prediction profile across ``age`` for each sex::
-
-    import numpy as np, pandas as pd
-    import statsmodels.formula.api as smf
-    from smmargins import Margins
-
-    fit = smf.logit("voted ~ age + income + C(educ) + female + age:female",
-                    data=df).fit()
-    M = Margins(fit)
-
-    M.dydx("age")                                  # AME of age
-    M.dydx("age", at="mean")                       # MEM
-    M.dydx("age", atexog={"female": [0, 1]})       # MER, by sex
-    M.predict(atexog={"age": list(range(20, 91, 10)),
-                      "female": [0, 1]})           # plottable table
-
-For a 2x2 difference-in-differences on the response (probability) scale::
-
-    res = M.did("group", "preexist_Y",
-                group_levels=["A", "B"], condition_levels=[0, 1],
-                atexog={"age": 60, "female": 0})
-    print(res)            # cells, simple effects, DiD
-    res.did.estimate      # the DiD point estimate
-    res.cells.vcov        # 4x4 joint covariance of the cell predictions
-
-See ``demo_margins.py`` and ``demo_did.py`` for end-to-end walkthroughs.
-"""
-
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass
+import warnings
 from typing import Callable, Optional, Union, Sequence, Mapping, List
 
 import numpy as np
 import pandas as pd
 import patsy
-from scipy import stats
 
-
-# ---------------------------------------------------------------------------
-# Numerical differentiation
-# ---------------------------------------------------------------------------
-
-def _central_jacobian(
-    func: Callable[[np.ndarray], np.ndarray],
-    x: np.ndarray,
-    rel_step: Optional[float] = None,
-) -> np.ndarray:
-    r"""Jacobian of ``func`` at ``x`` via central differences.
-
-    This is a numerical-analysis primitive used throughout the module
-    whenever an analytic derivative is unavailable.
-
-    Parameters
-    ----------
-    func : callable
-        Maps a length-``p`` vector to a scalar or length-``m`` vector.
-    x : ndarray of shape (p,)
-        Point at which to evaluate the Jacobian.
-    rel_step : float, optional
-        Relative step size. Default is :math:`\epsilon^{1/3}`, the
-        truncation-vs-rounding sweet spot for central differences.
-
-    Returns
-    -------
-    ndarray of shape (m, p)
-        The Jacobian matrix :math:`J_{ij} = \partial f_i / \partial x_j`.
-
-    Notes
-    -----
-    Uses the central-difference formula
-
-    .. math::
-
-        \frac{\partial f}{\partial x_j}
-        \approx \frac{f(x + h e_j) - f(x - h e_j)}{2 h_j},
-
-    where :math:`h_j = \text{rel\_step} \cdot \max(|x_j|, 1)` and
-    :math:`e_j` is the j-th unit vector.  The truncation error is
-    :math:`O(h^2)` and the round-off error is :math:`O(\epsilon / h)`;
-    choosing :math:`h \sim \epsilon^{1/3}` balances the two.
-
-    References
-    ----------
-    Nocedal, J. and Wright, S. J. (2006). *Numerical Optimization*,
-    2nd ed., Springer.  Chapter 8 (Calculating Derivatives).
-    """
-    x = np.asarray(x, dtype=float).ravel()
-    p = x.size
-    if rel_step is None:
-        rel_step = np.finfo(float).eps ** (1.0 / 3.0)
-    h = rel_step * np.maximum(np.abs(x), 1.0)
-
-    # Initial call to determine output size m
-    f0 = np.atleast_1d(np.asarray(func(x), dtype=float)).ravel()
-    m = f0.size
-    J = np.empty((m, p))
-
-    for i in range(p):
-        xi = x[i]
-        hi = h[i]
-        
-        # Perturb only dimension i
-        x_plus = x.copy()
-        x_plus[i] = xi + hi
-        
-        x_minus = x.copy()
-        x_minus[i] = xi - hi
-        
-        fp = np.atleast_1d(np.asarray(func(x_plus), dtype=float)).ravel()
-        fm = np.atleast_1d(np.asarray(func(x_minus), dtype=float)).ravel()
-        
-        # Central difference for each output component
-        J[:, i] = (fp - fm) / (2.0 * hi)
-
-    return J
-
-
-# ---------------------------------------------------------------------------
-# Marginal-effect method registry
-# ---------------------------------------------------------------------------
-#
-# Registry mapping method names to their column-prefix and statistic-name.
-# ``method`` selects the per-observation transform applied to the raw
-# derivative dy/dx_i before averaging:
-#
-#   dydx : dy/dx_i                       (level change in y per unit x)
-#   dyex : dy/dx_i * x_i                 (semi-elasticity: dy / d(ln x))
-#   eyex : dy/dx_i * x_i / y_i           (full elasticity)
-#   eydx : dy/dx_i / y_i                 (semi-elasticity: d(ln y) / dx)
-#
-# Stat-name strings match Stata's ``margins`` and statsmodels'
-# ``get_margeff`` column headers.
-
-_METHOD_META = {
-    "dydx": {"prefix": "d", "stat_name": "dy/dx"},
-    "dyex": {"prefix": "d", "stat_name": "dy/ex"},
-    "eyex": {"prefix": "e", "stat_name": "ey/ex"},
-    "eydx": {"prefix": "e", "stat_name": "ey/dx"},
-}
-
-
-# ---------------------------------------------------------------------------
-# Results container
-# ---------------------------------------------------------------------------
-
-class MarginsResult:
-    r"""Container for margin estimates with delta-method standard errors.
-
-    Holds the point estimate, standard error, confidence interval,
-    p-value, and the full delta-method covariance matrix of a vector of
-    margin statistics (e.g. adjusted predictions or marginal effects).
-
-    For a fitted model with parameter vector :math:`\hat\beta`, estimated
-    covariance :math:`\widehat V(\hat\beta)`, and a (possibly
-    vector-valued) statistic :math:`g(\beta)`, the delta method gives
-
-    .. math::
-
-        \widehat{\mathrm{Var}}[g(\hat\beta)] \approx
-        G \, \widehat V \, G^\top,
-
-    where :math:`G = \partial g / \partial \beta|_{\hat\beta}`.
-
-    Parameters
-    ----------
-    estimate : ndarray
-        Point estimates.
-    vcov : ndarray
-        Full delta-method covariance of the estimates (useful for joint
-        tests).
-    labels : sequence of str, optional
-        Row labels. Defaults to ``["m1", "m2", ...]``.
-    level : float
-        Confidence level for intervals (default 0.95).
-    df : int or None
-        Residual degrees of freedom; if set, uses t-distribution for
-        p-values and CIs. Otherwise uses N(0,1).
-    stat_name : str
-        Column name for the statistic in :meth:`summary`.
-
-    Attributes
-    ----------
-    estimate : ndarray
-    se       : ndarray
-    labels   : list[str]
-    vcov     : ndarray
-        Full delta-method covariance of the estimates (useful for joint
-        tests).
-    level    : float
-    df       : int or None
-    ci_lower : ndarray
-    ci_upper : ndarray
-    pvalue   : ndarray
-    zstat    : ndarray
-    _test_name : str
-        ``"z"`` or ``"t"`` depending on whether the normal or
-        t-distribution is used.
-
-    Examples
-    --------
-    Most users obtain a ``MarginsResult`` by calling ``Margins.predict`` or
-    ``Margins.dydx`` rather than constructing one directly. Once you have
-    a result, the typical workflow is to inspect ``.summary()`` or pull
-    fields off it::
-
-        res = M.dydx(["x1", "x2"])
-        res.summary()                # tidy table of estimates / SE / CI
-        res.estimate                 # ndarray of point estimates
-        res.vcov                     # joint delta-method covariance
-
-    Forming linear contrasts of the estimates uses the *joint* covariance
-    that is already on the result, so no additional differentiation is
-    required. For example, the difference between the AMEs of ``x1`` and
-    ``x2``::
-
-        res.contrast([1.0, -1.0], labels=["x1 - x2"])
-
-    Constructing one directly (mostly useful in tests)::
-
-        >>> import numpy as np
-        >>> from smmargins import MarginsResult
-        >>> est = np.array([1.0, 2.0])
-        >>> vcov = np.array([[0.25, 0.10],
-        ...                  [0.10, 0.16]])
-        >>> res = MarginsResult(est, vcov, labels=["m1", "m2"])
-        >>> res.se.round(2).tolist()
-        [0.5, 0.4]
-        >>> res.contrast([1.0, -1.0], labels=["m1 - m2"]).estimate.tolist()
-        [-1.0]
-
-    See Also
-    --------
-    Margins.predict
-    Margins.dydx
-    Margins.did
-    """
-
-    def __init__(
-        self,
-        estimate: np.ndarray,
-        vcov: np.ndarray,
-        labels: Optional[Sequence[str]] = None,
-        level: float = 0.95,
-        df: Optional[int] = None,
-        stat_name: str = "margin",
-    ):
-        self.estimate = np.atleast_1d(np.asarray(estimate, dtype=float))
-        self.vcov = np.atleast_2d(np.asarray(vcov, dtype=float))
-        self.se = np.sqrt(np.clip(np.diag(self.vcov), 0, None))
-        n = self.estimate.size
-        if labels is None:
-            labels = [f"m{i+1}" for i in range(n)]
-        self.labels = list(labels)
-        self.level = level
-        self.df = df
-        self.stat_name = stat_name
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            self.zstat = np.where(self.se > 0, self.estimate / self.se, np.nan)
-        alpha = 1.0 - level
-        if df is None:
-            self.pvalue = 2.0 * (1.0 - stats.norm.cdf(np.abs(self.zstat)))
-            crit = stats.norm.ppf(1.0 - alpha / 2.0)
-            self._test_name = "z"
-        else:
-            self.pvalue = 2.0 * (1.0 - stats.t.cdf(np.abs(self.zstat), df=df))
-            crit = stats.t.ppf(1.0 - alpha / 2.0, df=df)
-            self._test_name = "t"
-        self.ci_lower = self.estimate - crit * self.se
-        self.ci_upper = self.estimate + crit * self.se
-
-    def contrast(
-        self,
-        c: Union[Sequence[float], np.ndarray],
-        labels: Optional[Sequence[str]] = None,
-        name: str = "contrast",
-    ) -> "MarginsResult":
-        r"""Form linear contrasts of the estimates, with delta-method SEs.
-
-        If the estimates have joint covariance :math:`V_m`, any linear
-        combination :math:`C m` has covariance :math:`C V_m C^\top`, and
-        :math:`V_m` was already built from the delta method on
-        :math:`\beta`, so this is exact under the same approximation
-        (no extra differentiation).
-
-        Parameters
-        ----------
-        c : 1-D array of length n, or 2-D array of shape (k, n)
-            A single contrast vector or a matrix whose rows are contrasts.
-            ``n`` must equal ``len(self.estimate)``.
-        labels : sequence of str, optional
-            Row labels. Defaults to ``["c1", "c2", ...]``.
-        name : str
-            Column name for the statistic in the summary table.
-
-        Returns
-        -------
-        MarginsResult
-
-        Raises
-        ------
-        ValueError
-            If the number of contrast columns does not match the number of
-            estimates, or if ``labels`` length does not match the number of
-            contrasts.
-
-        Examples
-        --------
-        Suppose ``cells`` holds the four adjusted predictions of a 2x2
-        ``treat`` x ``post`` DiD, ordered as ``(0,0)``, ``(0,1)``,
-        ``(1,0)``, ``(1,1)``. The simple effect of ``treat`` at
-        ``post=1``, with delta-method SE::
-
-            cells.contrast([0, -1, 0, 1], labels=["treat | post=1"])
-
-        Stack three related contrasts so that you keep their joint
-        covariance (useful for joint Wald tests)::
-
-            joint = cells.contrast(
-                [[-1, 0, 1, 0],     # simple effect of treat at post=0
-                 [ 0,-1, 0, 1],     # simple effect of treat at post=1
-                 [ 1,-1,-1, 1]],    # DiD
-                labels=["simple @post=0", "simple @post=1", "DiD"],
-            )
-            joint.summary()
-            joint.vcov              # 3x3 — covariances across the three rows
-
-        A runnable smoke test from synthetic estimates::
-
-            >>> import numpy as np
-            >>> from smmargins import MarginsResult
-            >>> cells = MarginsResult(
-            ...     estimate=np.array([0.10, 0.20, 0.18, 0.40]),
-            ...     vcov=0.001 * np.eye(4),
-            ...     labels=["t=0,p=0", "t=0,p=1", "t=1,p=0", "t=1,p=1"],
-            ... )
-            >>> did = cells.contrast([1, -1, -1, 1], labels=["DiD"])
-            >>> float(did.estimate[0])
-            0.12
-            >>> round(float(did.se[0]), 4)
-            0.0632
-
-        References
-        ----------
-        [1] StataCorp. *Stata User's Guide*, Section
-           ``[R] margins, contrast``.
-        [2] Williams, R. (2012). Using the margins command to estimate
-           and interpret adjusted predictions and marginal effects.
-           *Stata Journal*, 12(2), 308–331.
-
-        See Also
-        --------
-        MarginsResult.summary
-        Margins.did
-        """
-        C = np.asarray(c, dtype=float)
-        if C.ndim == 1:
-            C = C.reshape(1, -1)
-        if C.shape[1] != self.estimate.size:
-            raise ValueError(
-                f"contrast has {C.shape[1]} columns, but there are "
-                f"{self.estimate.size} estimates to combine"
-            )
-        if labels is None:
-            labels = (
-                ["contrast"] if C.shape[0] == 1
-                else [f"c{i+1}" for i in range(C.shape[0])]
-            )
-        if len(labels) != C.shape[0]:
-            raise ValueError("labels length must match number of contrasts")
-
-        est = C @ self.estimate
-        vcov = C @ self.vcov @ C.T
-        return MarginsResult(
-            estimate=est, vcov=vcov, labels=labels,
-            level=self.level, df=self.df, stat_name=name,
-        )
-
-    def summary(self) -> pd.DataFrame:
-        r"""Return a summary DataFrame with estimates, SEs, and confidence intervals.
-
-        Returns
-        -------
-        pandas.DataFrame
-            One row per estimate, columns:
-            ``stat_name``, ``std.err``, ``z``/``t``, ``P>|z|``/``P>|t|``,
-            and the lower and upper confidence bounds.
-
-        Examples
-        --------
-        >>> import numpy as np
-        >>> from smmargins import MarginsResult
-        >>> tbl = MarginsResult(
-        ...     estimate=np.array([2.0]),
-        ...     vcov=np.array([[0.04]]),
-        ...     labels=["b"],
-        ... ).summary()
-        >>> list(tbl.columns)
-        ['margin', 'std.err', 'z', 'P>|z|', '[95% CI lo]', '[95% CI hi]']
-        >>> float(tbl.loc["b", "std.err"])
-        0.2
-        >>> float(tbl.loc["b", "z"])
-        10.0
-
-        For results that came from :class:`Margins`, ``summary()`` is what
-        ``__repr__`` prints — so ``print(M.dydx("x1"))`` already gives you
-        the same table.
-        """
-        tn = self._test_name
-        pct = int(round(self.level * 100))
-        return pd.DataFrame(
-            {
-                self.stat_name: self.estimate,
-                "std.err": self.se,
-                tn: self.zstat,
-                f"P>|{tn}|": self.pvalue,
-                f"[{pct}% CI lo]": self.ci_lower,
-                f"[{pct}% CI hi]": self.ci_upper,
-            },
-            index=self.labels,
-        )
-
-    def __repr__(self) -> str:
-        """Return a string representation of the summary table."""
-        return self.summary().to_string(float_format=lambda v: f"{v: .6f}")
-
-
-# ---------------------------------------------------------------------------
-# Evaluation profile
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Profile:
-    """Evaluation profile: how to turn a data-space frame into a design matrix.
-
-    The two flags express the semantic split that the ``at`` /
-    ``factor_stat`` combinations encode, applied at different phases.
-
-    Attributes
-    ----------
-    frame : pd.DataFrame
-        The data-space frame used as the evaluation base.
-    collapse_design : bool, default False
-        If True, average the design matrix column-wise after building,
-        so factor dummies become their observed proportions (Stata
-        ``atmeans``).
-    collapse_numerics : bool, default False
-        If True, replace row-varying numeric columns in the data-space
-        frame with their training mean *before* perturbation. Needed
-        for count and discrete contrasts under MEM so derived columns
-        like ``I(x**2)`` evaluate to ``mean(x)**2``.
-
-    Notes
-    -----
-    ``collapse_numerics`` (pre-perturbation) is applied by the caller
-    (e.g. ``_design_pairs``) *before* perturbing the frame, so that
-    the perturbation is not overwritten by the mean-substitution.
-    ``collapse_design`` (post-build) is applied by ``materialize``
-    after ``_build_exog``.
-    """
-
-    frame: pd.DataFrame
-    collapse_design: bool = False
-    collapse_numerics: bool = False
-
-    def prepare_frame(self, frame: pd.DataFrame, margins: "Margins") -> pd.DataFrame:
-        """Apply numerics-collapse to a frame when configured.
-
-        Parameters
-        ----------
-        frame : pd.DataFrame
-            Data-space frame to prepare.
-        margins : Margins
-            Margins instance providing ``_collapse_numerics_to_mean``.
-
-        Returns
-        -------
-        pd.DataFrame
-            The prepared frame (collapsed or unchanged).
-        """
-        if self.collapse_numerics:
-            return margins._collapse_numerics_to_mean(frame)
-        return frame
-
-    def materialize(self, frame: pd.DataFrame, margins: "Margins") -> np.ndarray:
-        """Run the full pipeline (numerics collapse \u2192 build \u2192 design collapse).
-
-        Parameters
-        ----------
-        frame : pd.DataFrame
-            Data-space frame to materialize.
-        margins : Margins
-            Margins instance providing ``_build_exog`` and
-            ``_collapse_numerics_to_mean``.
-
-        Returns
-        -------
-        ndarray
-            Final design matrix ready for prediction.
-
-        Notes
-        -----
-        Use this when there is no perturbation step in between, e.g.
-        ``predict`` or the unperturbed reference design in elasticities.
-        Paired-contrast callers need to interleave a perturb step between
-        the two phases \u2014 they should call ``prepare_frame`` themselves,
-        perturb, then build / ``collapse_design`` manually (or use
-        ``_design_pairs``).
-        """
-        frame = self.prepare_frame(frame, margins)
-        X = margins._build_exog(frame)
-        if self.collapse_design:
-            X = X.mean(axis=0, keepdims=True)
-        return X
-
-
-# ---------------------------------------------------------------------------
-# Main class
-# ---------------------------------------------------------------------------
+from .results import MarginsResult, DiDResult
+from .data import _Profile
+from .utils import _central_jacobian, _METHOD_META
 
 class Margins:
     r"""Compute adjusted predictions and marginal effects for a StatsModels fit.
@@ -703,7 +147,14 @@ class Margins:
     ):
         self.results = results
         self.model = results.model
-        self.params = np.asarray(results.params, dtype=float).ravel()
+        params_arr = np.asarray(results.params, dtype=float)
+        if params_arr.ndim == 2:
+            # MNLogit and similar store params as (p, K-1) matrices.
+            # statsmodels' flat vector and cov_params use Fortran (column-major)
+            # order, so we must match that.
+            self.params = params_arr.ravel(order="F")
+        else:
+            self.params = params_arr.ravel()
         self.cov = np.asarray(results.cov_params(), dtype=float)
         if self.cov.shape != (self.params.size, self.params.size):
             raise ValueError(
@@ -737,15 +188,26 @@ class Margins:
             # Sanity check alignment
             n_exog = self.model.exog.shape[1]
             n_params = self.params.size
-            if n_exog != n_params:
+            # Multi-outcome models have more parameters than exog columns
+            expected_params = n_exog
+            if hasattr(self.model, "J"):
+                # MNLogit: params shape (p, K-1) -> p*(K-1) flat
+                expected_params = n_exog * (self.model.J - 1)
+            elif hasattr(self.model, "k_extra"):
+                # OrderedModel: p + (K-1) thresholds
+                expected_params = n_exog + self.model.k_extra
+            if n_params != expected_params:
                 raise ValueError(
-                    f"Model has {n_exog} exog columns but {n_params} parameters. "
-                    "Cannot use raw mode."
+                    f"Model has {n_exog} exog columns but {n_params} parameters "
+                    f"(expected {expected_params}). Cannot use raw mode."
                 )
-            if len(self.model.exog_names) != n_params:
+            # exog_names may include threshold parameters for OrderedModel,
+            # so only validate the first n_exog names match the data columns.
+            exog_names = list(self.model.exog_names)
+            if len(exog_names) < n_exog:
                 raise ValueError(
-                    f"Model has {len(self.model.exog_names)} exog_names but "
-                    f"{n_params} parameters. Cannot use raw mode."
+                    f"Model has {len(exog_names)} exog_names but "
+                    f"{n_exog} exog columns. Cannot use raw mode."
                 )
 
         # Cache training offset/exposure for _predict broadcasting on smaller
@@ -759,6 +221,74 @@ class Margins:
         self._n_train = (self.model.exog.shape[0]
                          if getattr(self.model, "exog", None) is not None else None)
         self._mean_log_offset_value = self._compute_mean_log_offset()
+
+        # Detect number of outcome classes for multi-outcome models
+        self._n_outcomes = self._detect_n_outcomes()
+        self._outcome_labels = self._detect_outcome_labels()
+
+    def _detect_n_outcomes(self) -> int:
+        """Detect the number of outcome classes (K) for the fitted model.
+
+        Returns
+        -------
+        int
+            Number of outcome classes. 1 for single-outcome models.
+        """
+        # MNLogit
+        if hasattr(self.model, "J"):
+            return int(self.model.J)
+        # OrderedModel
+        if hasattr(self.model, "k_extra"):
+            return int(self.model.k_extra) + 1
+        # Last resort: probe with a 1-row prediction
+        try:
+            exog = getattr(self.model, "exog", None)
+            if exog is not None and exog.shape[0] > 0:
+                probe = exog[:1]
+                pred = self.model.predict(self.results.params, probe)
+                pred_arr = np.asarray(pred)
+                if pred_arr.ndim == 2:
+                    return pred_arr.shape[1]
+        except Exception:
+            pass
+        return 1
+
+    def _detect_outcome_labels(self) -> Optional[List[str]]:
+        """Detect outcome class labels for multi-outcome models.
+
+        Returns
+        -------
+        list of str or None
+            Labels for each outcome class, or None for single-outcome models.
+        """
+        if self._n_outcomes == 1:
+            return None
+        # MNLogit
+        ynames = getattr(self.model, "_ynames_map", None)
+        if ynames is not None:
+            # ynames_map maps class index -> label
+            labels = [str(ynames.get(i, i)) for i in range(self._n_outcomes)]
+            return labels
+        # Try to infer from endog
+        endog = getattr(self.model, "endog", None)
+        if endog is not None:
+            try:
+                uniq = np.unique(endog)
+                if len(uniq) == self._n_outcomes:
+                    return [str(u) for u in uniq]
+            except Exception:
+                pass
+        return [str(i) for i in range(self._n_outcomes)]
+
+    @property
+    def n_outcomes(self) -> int:
+        """Number of outcome classes (K) for the fitted model."""
+        return self._n_outcomes
+
+    @property
+    def outcome_labels(self) -> Optional[List[str]]:
+        """Outcome class labels for multi-outcome models, or None."""
+        return self._outcome_labels
 
     def _compute_mean_log_offset(self) -> Optional[float]:
         """Mean of (offset + log(exposure)) across the training sample.
@@ -815,7 +345,12 @@ class Margins:
         try:
             return self.model.data.frame
         except AttributeError:
-            return None
+            pass
+        # Some models (e.g. MNLogit, OrderedModel) store the data in orig_exog
+        orig_exog = getattr(self.model.data, "orig_exog", None)
+        if orig_exog is not None and hasattr(orig_exog, "columns"):
+            return pd.DataFrame(orig_exog)
+        return None
 
     def _try_get_design_info(self):
         """Retrieve the patsy DesignInfo from the model, if available.
@@ -862,9 +397,13 @@ class Margins:
         If the model was fit with a formula, this uses patsy's DesignInfo
         to rebuild the matrix (handling interactions, etc.). If fit with
         raw matrices, it selects columns matching ``model.exog_names``.
+        For OrderedModel, ``exog_names`` includes threshold parameters;
+        we truncate to the actual number of exog columns.
         """
         if self._raw_mode:
-            cols = list(self.model.exog_names)
+            names = list(self.model.exog_names)
+            n_exog = self.model.exog.shape[1]
+            cols = names[:n_exog]
             return np.asarray(frame[cols].to_numpy(dtype=float))
         dm = patsy.dmatrix(self.design_info, frame, return_type="matrix")
         return np.asarray(dm)
@@ -876,15 +415,16 @@ class Margins:
 
         Parameters
         ----------
-        params : ndarray of shape (p,)
+        params : ndarray of shape (p,) or (p, K-1)
             Parameter vector override.
         exog : ndarray of shape (n, p)
             Design matrix.
 
         Returns
         -------
-        ndarray of shape (n,)
-            Predicted values on the response scale.
+        ndarray of shape (n, K)
+            Predicted values on the response scale. Single-outcome models
+            return ``(n, 1)``; multi-outcome models return ``(n, K)``.
 
         Notes
         -----
@@ -903,16 +443,29 @@ class Margins:
                 and n_exog != self._n_train
                 and self._mean_log_offset_value is not None):
             kwargs["offset"] = np.full(n_exog, self._mean_log_offset_value)
+
+        # Multi-outcome models may need params in matrix form
+        params_use = np.asarray(params)
+        if self._is_mnlogit():
+            p = exog_arr.shape[1]
+            K = self.n_outcomes
+            params_use = params_use.reshape(p, K - 1, order="F")
+
         try:
-            return np.asarray(self.model.predict(params, exog, **kwargs))
+            pred = np.asarray(self.model.predict(params_use, exog, **kwargs))
         except (TypeError, ValueError, KeyError):
-            eta = exog_arr @ np.asarray(params)
+            eta = exog_arr @ np.asarray(params_use)
             if "offset" in kwargs:
                 eta = eta + kwargs["offset"]
             fam = getattr(self.model, "family", None)
             if fam is not None:
-                return np.asarray(fam.link.inverse(eta))
-            return eta
+                pred = np.asarray(fam.link.inverse(eta))
+            else:
+                pred = eta
+        # Enforce (n, K) shape invariant
+        if pred.ndim == 1:
+            pred = pred.reshape(-1, 1)
+        return pred
 
     # ---- analytic outer-Jacobian support ----
 
@@ -963,32 +516,33 @@ class Margins:
             return lambda eta: np.ones_like(np.asarray(eta, dtype=float))
         return None
 
-    @staticmethod
     def _grad_mean_predict(
+        self,
         X: np.ndarray,
         beta: np.ndarray,
-        fprime: Callable[[np.ndarray], np.ndarray],
+        fprime: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ) -> np.ndarray:
         r"""Gradient of the mean prediction with respect to parameters.
 
         Computes
         :math:`\partial/\partial\beta` of
-        :math:`(1/n)\sum_i f(x_i^\top\beta)`, returning shape ``(p,)``.
+        :math:`(1/n)\sum_i f(x_i^\top\beta)`, returning shape ``(K, p)``.
 
         Parameters
         ----------
         X : ndarray of shape (n, p)
             Design matrix.
-        beta : ndarray of shape (p,)
+        beta : ndarray of shape (p,) or (p, K-1)
             Parameter vector.
-        fprime : callable
+        fprime : callable, optional
             Function returning :math:`f'(\eta)` for each linear
-            predictor value.
+            predictor value. Required for single-outcome models.
 
         Returns
         -------
-        ndarray of shape (p,)
-            Gradient vector.
+        ndarray of shape (K, p_full)
+            Gradient matrix. Single-outcome models return ``(1, p)``;
+            MNLogit returns ``(K, p*(K-1))``.
 
         Notes
         -----
@@ -998,9 +552,77 @@ class Margins:
         is a linear combination of these gradients.
         """
         X = np.asarray(X, dtype=float)
+        if self._is_mnlogit():
+            return self._softmax_grad_mean(X, beta)
+        # Single-outcome path (OLS, GLM, etc.)
+        if fprime is None:
+            raise ValueError(
+                "fprime is required for single-outcome _grad_mean_predict"
+            )
         eta = X @ beta
         fp = np.asarray(fprime(eta), dtype=float).ravel()
-        return (fp[:, None] * X).sum(axis=0) / X.shape[0]
+        grad = (fp[:, None] * X).sum(axis=0) / X.shape[0]
+        return grad.reshape(1, -1)
+
+    def _is_mnlogit(self) -> bool:
+        """Return True if the fitted model is MNLogit."""
+        return hasattr(self.model, "J") and getattr(self.model, "k_extra", None) == 0
+
+    def _is_ordered_model(self) -> bool:
+        """Return True if the fitted model is OrderedModel."""
+        k_extra = getattr(self.model, "k_extra", None)
+        return k_extra is not None and k_extra > 0
+
+    @staticmethod
+    def _softmax_grad_mean(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
+        r"""Analytic gradient of mean softmax probabilities for MNLogit.
+
+        For a K-class multinomial logit with class 0 as reference,
+        computes the gradient of
+        :math:`(1/n)\sum_i P(Y=c \mid x_i)` w.r.t. the flat parameter
+        vector for every class c.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n, p)
+            Design matrix.
+        beta : ndarray of shape (p*(K-1),)
+            Flat parameter vector in column-major (Fortran) order:
+            ``[beta_1, beta_2, ..., beta_{K-1}]`` where each ``beta_k``
+            has length ``p``.
+
+        Returns
+        -------
+        ndarray of shape (K, p*(K-1))
+            Gradient matrix. Row ``c`` is the gradient for outcome class ``c``.
+        """
+        X = np.asarray(X, dtype=float)
+        n, p = X.shape
+        # beta is flat vector of length p*(K-1)
+        # Reshape to (p, K-1) in Fortran order (class blocks contiguous)
+        K = beta.size // p + 1
+        B = beta.reshape(p, K - 1, order="F")
+        # Linear predictors for classes 1..K-1
+        eta = X @ B  # (n, K-1)
+        # Probabilities
+        exp_eta = np.exp(eta)
+        denom = 1 + exp_eta.sum(axis=1, keepdims=True)  # (n, 1)
+        P_alt = exp_eta / denom  # (n, K-1)
+        P_0 = 1 / denom  # (n, 1)
+        P = np.hstack([P_0, P_alt])  # (n, K)
+
+        # delta_{c,k} for c=0..K-1, k=1..K-1
+        delta = np.zeros((K, K - 1))
+        for k in range(1, K):
+            delta[k, k - 1] = 1.0
+
+        # weight[i, c, k] = P_{c,i} * (delta_{c,k} - P_{k,i})
+        diff = delta[None, :, :] - P[:, None, 1:]  # (n, K, K-1)
+        weight = P[:, :, None] * diff  # (n, K, K-1)
+
+        # grad_{c,k} = (1/n) sum_i weight[i,c,k] * x_i
+        grad_3d = np.einsum("nck,np->ckp", weight, X) / n  # (K, K-1, p)
+        return grad_3d.reshape(K, p * (K - 1))
 
     # ---- shared paired-contrast machinery ------------------------------------
     #
@@ -1082,24 +704,24 @@ class Margins:
         n = len(pairs)
 
         def statistic(beta: np.ndarray) -> np.ndarray:
-            out = np.empty(n)
+            parts = []
             for i, (Xa, Xb) in enumerate(pairs):
-                ya = float(np.mean(self._predict(beta, Xa)))
-                yb = float(np.mean(self._predict(beta, Xb)))
-                out[i] = (ya - yb) * scale
-            return out
+                ya = np.mean(self._predict(beta, Xa), axis=0)
+                yb = np.mean(self._predict(beta, Xb), axis=0)
+                parts.append(np.atleast_1d((ya - yb) * scale))
+            return np.vstack(parts)
 
         fprime = self._link_deriv()
-        if fprime is None:
+        if fprime is None and not self._is_mnlogit():
             return statistic, None
 
         def jac(beta: np.ndarray) -> np.ndarray:
-            J = np.empty((n, beta.size))
+            parts = []
             for i, (Xa, Xb) in enumerate(pairs):
                 ga = self._grad_mean_predict(Xa, beta, fprime)
                 gb = self._grad_mean_predict(Xb, beta, fprime)
-                J[i, :] = (ga - gb) * scale
-            return J
+                parts.append((ga - gb) * scale)
+            return np.vstack(parts)
 
         return statistic, jac
 
@@ -1415,6 +1037,7 @@ class Margins:
         labels: Sequence[str],
         stat_name: str,
         jac: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
     ) -> MarginsResult:
         r"""Apply the delta method to a vector-valued statistic.
 
@@ -1447,10 +1070,37 @@ class Margins:
         -----
         This is the core inference primitive shared by every public API
         method (``predict``, ``dydx``, ``did``).
+
+        For multi-outcome models, the statistic returns shape ``(m, K)``.
+        The estimate is flattened row-major (outcome varies fastest) and
+        labels are expanded to ``m * K`` entries. The Jacobian is expected
+        to already be ``(m*K, p)``.
         """
         beta = self.params
         est_val = statistic(beta)
-        est = np.atleast_1d(np.asarray(est_val, dtype=float)).ravel()
+        est_arr = np.asarray(est_val, dtype=float)
+
+        outcome_index: Optional[np.ndarray] = None
+        outcome_labels_out: Optional[List[str]] = None
+
+        if est_arr.ndim == 2 and est_arr.shape[1] > 1:
+            m, K = est_arr.shape
+            est = est_arr.ravel()
+            # Expand labels: each base label repeated K times with outcome suffix
+            expanded_labels: List[str] = []
+            for lab in labels:
+                for k in range(K):
+                    suffix = (
+                        self.outcome_labels[k]
+                        if self.outcome_labels is not None
+                        else str(k)
+                    )
+                    expanded_labels.append(f"{lab} ({suffix})")
+            labels = expanded_labels
+            outcome_index = np.tile(np.arange(K), m)
+            outcome_labels_out = self.outcome_labels
+        else:
+            est = est_arr.ravel()
 
         if jac is not None:
             J = np.atleast_2d(np.asarray(jac(beta), dtype=float))
@@ -1460,9 +1110,37 @@ class Margins:
             J = _central_jacobian(statistic, beta)
 
         V = J @ self.cov @ J.T
+
+        # Apply outcome subsetting if requested
+        if outcome is not None and self.n_outcomes > 1 and outcome_index is not None:
+            keys = [outcome] if isinstance(outcome, (int, str)) else list(outcome)
+            keep_indices: set[int] = set()
+            for key in keys:
+                if isinstance(key, str):
+                    if self.outcome_labels is None or key not in self.outcome_labels:
+                        raise ValueError(f"Outcome {key!r} not found")
+                    keep_indices.add(self.outcome_labels.index(key))
+                else:
+                    idx = int(key)
+                    if self.outcome_labels is not None and not (
+                        0 <= idx < len(self.outcome_labels)
+                    ):
+                        raise ValueError(f"Outcome index {idx} out of range")
+                    keep_indices.add(idx)
+            mask = np.isin(outcome_index, list(keep_indices))
+            if not np.any(mask):
+                raise ValueError(f"No rows found for outcome(s) {keys}")
+            est = est[mask]
+            J = J[mask, :]
+            V = V[np.ix_(mask, mask)]
+            labels = [labels[i] for i in np.where(mask)[0]]
+            outcome_index = outcome_index[mask]
+
         return MarginsResult(
             estimate=est, vcov=V, labels=labels,
             level=self.level, df=self.df, stat_name=stat_name,
+            outcome_labels=outcome_labels_out,
+            outcome_index=outcome_index,
         )
 
     # ======================================================================}
@@ -1474,6 +1152,7 @@ class Margins:
             at: str = "overall",
             atexog: Optional[Mapping[str, object]] = None,
             factor_stat: Optional[str] = None,
+            outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
         ) -> MarginsResult:
         r"""Compute adjusted predictions (expected outcome on the response scale).
 
@@ -1593,22 +1272,25 @@ class Margins:
         Xs = [profile.materialize(f, self) for f in frames]
 
         def statistic(beta: np.ndarray) -> np.ndarray:
-            out = np.empty(len(Xs))
+            parts = []
             for i, X in enumerate(Xs):
-                out[i] = float(np.mean(self._predict(beta, X)))
-            return out
+                parts.append(np.atleast_1d(np.mean(self._predict(beta, X), axis=0)))
+            return np.vstack(parts)
 
         fprime = self._link_deriv()
-        if fprime is not None:
+        if fprime is not None or self._is_mnlogit():
             def jac(beta: np.ndarray) -> np.ndarray:
-                J = np.empty((len(Xs), beta.size))
+                parts = []
                 for i, X in enumerate(Xs):
-                    J[i, :] = self._grad_mean_predict(X, beta, fprime)
-                return J
+                    parts.append(self._grad_mean_predict(X, beta, fprime))
+                return np.vstack(parts)
         else:
             jac = None
 
-        return self._delta(statistic, labels=labels, stat_name=stat_name, jac=jac)
+        return self._delta(
+            statistic, labels=labels, stat_name=stat_name, jac=jac,
+            outcome=outcome,
+        )
 
     # ======================================================================}
     # Public API: marginal effects
@@ -1625,6 +1307,7 @@ class Margins:
             reference: Optional[object] = None,
             factor_stat: Optional[str] = None,
             method: str = "dydx",
+            outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
         ) -> MarginsResult:
         r"""Marginal effect of ``variable`` on the response.
 
@@ -1813,7 +1496,6 @@ class Margins:
                         f"dtype {col.dtype}"
                     )
                 if not pd.api.types.is_integer_dtype(col):
-                    import warnings
                     warnings.warn(
                         f"count=True applied to a float column ({v!r}); "
                         "the contrast x -> x+1 may not be physically meaningful.",
@@ -1858,11 +1540,11 @@ class Margins:
             def stacked_stat(beta: np.ndarray) -> np.ndarray:
                 res = []
                 for fn, _, _, _ in p_list:
-                    # fn is the statistic function for one variable. 
+                    # fn is the statistic function for one variable.
                     # We MUST pass beta to it.
-                    val = np.atleast_1d(np.asarray(fn(beta), dtype=float)).ravel()
+                    val = np.asarray(fn(beta), dtype=float)
                     res.append(val)
-                return np.concatenate(res)
+                return np.vstack(res)
             return stacked_stat
 
         def make_stacked_jac(p_list):
@@ -1876,7 +1558,7 @@ class Margins:
                 for _, j, _, _ in p_list:
                     # j is the jacobian function for one variable.
                     # We MUST pass beta to it.
-                    val = np.atleast_2d(np.asarray(j(beta), dtype=float))
+                    val = np.asarray(j(beta), dtype=float)
                     res.append(val)
                 return np.vstack(res)
             return stacked_jac
@@ -1891,7 +1573,10 @@ class Margins:
         names = {p[3] for p in parts}
         stat_name = names.pop() if len(names) == 1 else "mixed"
 
-        return self._delta(statistic, labels=labels, stat_name=stat_name, jac=jac_fn)
+        return self._delta(
+            statistic, labels=labels, stat_name=stat_name, jac=jac_fn,
+            outcome=outcome,
+        )
 
     # ----- continuous case (numerical derivative) ---------------------------
 
@@ -2007,20 +1692,31 @@ class Margins:
             x_vals.append(x_col)
 
         def statistic(beta: np.ndarray) -> np.ndarray:
-            out = np.empty(len(Xs_plus))
+            parts = []
             for i in range(len(Xs_plus)):
                 dydx_i = (self._predict(beta, Xs_plus[i])
                           - self._predict(beta, Xs_minus[i])) / (2.0 * h)
+                x_i = np.asarray(x_vals[i])
+                if x_i.ndim == 1:
+                    x_i = x_i[:, None]
                 if method == "dyex":
-                    contrib = dydx_i * x_vals[i]
+                    contrib = dydx_i * x_i
                 else:  # eyex / eydx
                     y_i = self._predict(beta, Xs_orig[i])
+                    if np.any(y_i < 1e-12):
+                        warnings.warn(
+                            "predicted probabilities below 1e-12 for some "
+                            "outcome classes; elasticities for those classes "
+                            "are unstable",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
                     if method == "eyex":
-                        contrib = dydx_i * x_vals[i] / y_i
+                        contrib = dydx_i * x_i / y_i
                     else:  # eydx
                         contrib = dydx_i / y_i
-                out[i] = np.mean(contrib)
-            return out
+                parts.append(np.atleast_1d(np.mean(contrib, axis=0)))
+            return np.vstack(parts)
 
         # Analytic outer jac would require quotient-rule plumbing for the
         # per-row 1/y_i; FD is fine.
@@ -2211,6 +1907,15 @@ class Margins:
         response-scale DiD with a delta-method SE is the right thing to
         report.
 
+        For multi-outcome models (MNLogit, OrderedModel), each cell
+        prediction is a K-vector of class probabilities. The contrast
+        matrix lifts to a block-diagonal (3*K, 4*K) matrix via a
+        Kronecker product with ``eye(K)``, so the returned ``DiDResult``
+        carries the K-outcome axis on ``cells``, ``simple_effects``,
+        ``did``, and ``joint``.  The ``joint`` field can be used for
+        cross-outcome contrasts (e.g. ``joint.contrast(...)`` to compare
+        the DiD of one class against another).
+
         Examples
         --------
         Healthcare-style 2x2: does the rate of condition X differ between
@@ -2292,11 +1997,24 @@ class Margins:
         atexog_full[condition] = c
         cells = self.predict(at=at, atexog=atexog_full, factor_stat=factor_stat)
 
+        K = self.n_outcomes
+        outcome_names = (
+            self.outcome_labels if self.outcome_labels is not None
+            else [str(i) for i in range(K)]
+        )
+
         # Rewrite the cell labels to the compact "(group=A, condition=0)" form
-        cells.labels = [
-            f"{group}={gv}, {condition}={cv}"
-            for gv in g for cv in c
-        ]
+        if K > 1:
+            cells.labels = [
+                f"{group}={gv}, {condition}={cv} | outcome={ok}"
+                for gv in g for cv in c
+                for ok in outcome_names
+            ]
+        else:
+            cells.labels = [
+                f"{group}={gv}, {condition}={cv}"
+                for gv in g for cv in c
+            ]
 
         # Contrast matrix:
         #   row 0: simple effect of group at condition=c0  -> -m0 + m2
@@ -2307,30 +2025,63 @@ class Margins:
             [ 0.0,-1.0, 0.0, 1.0],
             [ 1.0,-1.0,-1.0, 1.0],
         ])
-        all_contrasts = cells.contrast(
-            C_all,
-            labels=[
+        if K > 1:
+            C_all = np.kron(C_all, np.eye(K))  # shape (3*K, 4*K)
+
+        if K > 1:
+            contrast_labels = [
+                f"{group}: {g[1]} vs {g[0]} | {condition}={c[0]} | outcome={ok}"
+                for ok in outcome_names
+            ] + [
+                f"{group}: {g[1]} vs {g[0]} | {condition}={c[1]} | outcome={ok}"
+                for ok in outcome_names
+            ] + [
+                f"DiD: {group}({g[1]}-{g[0]}) × {condition}({c[1]}-{c[0]}) | outcome={ok}"
+                for ok in outcome_names
+            ]
+        else:
+            contrast_labels = [
                 f"{group}: {g[1]} vs {g[0]} | {condition}={c[0]}",
                 f"{group}: {g[1]} vs {g[0]} | {condition}={c[1]}",
                 f"DiD: {group}({g[1]}-{g[0]}) × {condition}({c[1]}-{c[0]})",
-            ],
+            ]
+
+        all_contrasts = cells.contrast(
+            C_all,
+            labels=contrast_labels,
             name="estimate",
         )
+
+        # Build joint result with outcome metadata for multi-outcome models
+        joint_outcome_index = (np.tile(np.arange(K), 3) if K > 1 else None)
+        joint = MarginsResult(
+            estimate=all_contrasts.estimate,
+            vcov=all_contrasts.vcov,
+            labels=all_contrasts.labels,
+            level=self.level, df=self.df, stat_name="estimate",
+            outcome_labels=self.outcome_labels if K > 1 else None,
+            outcome_index=joint_outcome_index,
+        )
+
         # Slice back apart so users can grab each piece
         simple = MarginsResult(
-            estimate=all_contrasts.estimate[:2],
-            vcov=all_contrasts.vcov[:2, :2],
-            labels=all_contrasts.labels[:2],
+            estimate=joint.estimate[:2 * K],
+            vcov=joint.vcov[:2 * K, :2 * K],
+            labels=joint.labels[:2 * K],
             level=self.level, df=self.df, stat_name="simple effect",
+            outcome_labels=self.outcome_labels if K > 1 else None,
+            outcome_index=(np.tile(np.arange(K), 2) if K > 1 else None),
         )
         did_ = MarginsResult(
-            estimate=all_contrasts.estimate[2:3],
-            vcov=all_contrasts.vcov[2:3, 2:3],
-            labels=[all_contrasts.labels[2]],
+            estimate=joint.estimate[2 * K:3 * K],
+            vcov=joint.vcov[2 * K:3 * K, 2 * K:3 * K],
+            labels=joint.labels[2 * K:3 * K],
             level=self.level, df=self.df, stat_name="DiD",
+            outcome_labels=self.outcome_labels if K > 1 else None,
+            outcome_index=(np.arange(K) if K > 1 else None),
         )
         return DiDResult(cells=cells, simple_effects=simple, did=did_,
-                         joint=all_contrasts)
+                         joint=joint)
 
     def _default_two_levels(self, col: str) -> list:
         """Return the two most extreme unique levels of a column.
@@ -2363,121 +2114,3 @@ class Margins:
         return vals
 
 
-# ---------------------------------------------------------------------------
-# DiDResult — small container bundling cells / simple effects / DiD
-# ---------------------------------------------------------------------------
-
-class DiDResult:
-    r"""Bundle of results from :meth:`Margins.did`.
-
-    Holds the four cell predictions, the two simple effects, the
-    difference-in-differences estimate, and a joint result that contains
-    all three contrasts with their shared covariance.
-
-    Parameters
-    ----------
-    cells : MarginsResult
-        The four adjusted predictions.
-    simple_effects : MarginsResult
-        Group effect evaluated at each level of the condition.
-    did : MarginsResult
-        The single difference-in-differences estimate.
-    joint : MarginsResult
-        All three contrasts (2 simple effects + DiD) sharing joint vcov,
-        useful if you want to jointly test e.g.
-        ``simple_effects = did = 0``.
-
-    Attributes
-    ----------
-    cells : MarginsResult
-    simple_effects : MarginsResult
-    did : MarginsResult
-    joint : MarginsResult
-
-    Examples
-    --------
-    Use the bundle to grab whichever piece you want::
-
-        res = M.did("group", "preexist_Y",
-                    group_levels=["A", "B"], condition_levels=[0, 1])
-        print(res)                          # full report (cells + effects + DiD)
-        res.cells.summary()                 # 4-row table for plotting
-        res.simple_effects.estimate         # 2 group-effects, one per Y level
-        res.did.estimate                    # the single DiD on the response scale
-        res.joint.vcov                      # 3x3 covariance for joint Wald tests
-
-    Runnable smoke test::
-
-        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-        >>> from smmargins import Margins
-        >>> rng = np.random.default_rng(0)
-        >>> df = pd.DataFrame({
-        ...     "treat": rng.integers(0, 2, 200),
-        ...     "post":  rng.integers(0, 2, 200),
-        ... })
-        >>> df["y"] = (df["treat"] + df["post"] + 0.5 * df["treat"] * df["post"]
-        ...            + rng.standard_normal(200))
-        >>> res = Margins(smf.ols("y ~ treat * post", df).fit()).did("treat", "post")
-        >>> res.cells.estimate.shape
-        (4,)
-        >>> res.simple_effects.estimate.shape
-        (2,)
-        >>> res.did.estimate.shape
-        (1,)
-        >>> res.joint.vcov.shape
-        (3, 3)
-    """
-
-    def __init__(self, cells: MarginsResult, simple_effects: MarginsResult,
-                 did: MarginsResult, joint: MarginsResult):
-        self.cells = cells
-        self.simple_effects = simple_effects
-        self.did = did
-        self.joint = joint
-
-    def summary(self) -> pd.DataFrame:
-        r"""Return the full DiD summary as one concatenated DataFrame.
-
-        Returns
-        -------
-        pandas.DataFrame
-            Vertically concatenated summaries of ``cells``, ``simple_effects``,
-            and ``did``, with an extra column indicating the block
-            (``"cell"``, ``"simple"``, ``"DiD"``).
-
-        Examples
-        --------
-        >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-        >>> from smmargins import Margins
-        >>> np.random.seed(0)
-        >>> df = pd.DataFrame({
-        ...     "y": np.random.randn(10),
-        ...     "treat": np.repeat([0, 1], 5),
-        ...     "post": np.tile([0, 1], 5),
-        ... })
-        >>> fit = smf.ols("y ~ treat * post", df).fit()
-        >>> did = Margins(fit).did("treat", "post")
-        >>> isinstance(did.summary(), pd.DataFrame)
-        True
-        >>> len(did.summary())
-        7
-        """
-        parts = [
-            self.cells.summary().assign(**{"": "cell"}),
-            self.simple_effects.summary().assign(**{"": "simple"}),
-            self.did.summary().assign(**{"": "DiD"}),
-        ]
-        return pd.concat(parts)
-
-    def __repr__(self) -> str:
-        """Return a formatted string with cell predictions, simple effects, and DiD."""
-        def banner(title: str) -> str:
-            return "\n" + title + "\n" + "-" * len(title)
-        return "\n".join([
-            banner("Cell predictions"),
-            repr(self.cells),
-            banner("Simple effects"),
-            repr(self.simple_effects),
-            banner("Difference-in-differences"),
-            repr(self.did),
-        ])
