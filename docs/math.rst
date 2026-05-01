@@ -152,8 +152,9 @@ compute it analytically when possible:
   ``family.link.inverse_deriv``. This covers Logit, Probit, Poisson,
   NegBin, Gamma, and Gaussian out of the box.
 - For ``OLS`` / ``WLS`` / ``GLS``, :math:`f' \equiv 1` (identity link).
+- For ``MNLogit``, we use an analytic softmax-derivative gradient.
 
-Whenever an analytic :math:`f'` is available **and** the linear
+Whenever an analytic :math:`f'` or Jacobian is available **and** the linear
 predictor is :math:`\eta = X\beta` (no offset/exposure), the chain rule
 gives :math:`\partial g/\partial\beta` in closed form, saving
 :math:`p` forward ``predict`` calls per statistic.
@@ -170,13 +171,16 @@ The fallback is central differences,
 with :math:`h_j` chosen to balance truncation error
 (:math:`O(h^2)`) against round-off (:math:`O(\epsilon/h)`); the
 optimum scales as :math:`h \sim \epsilon^{1/3}`. See
-:func:`~smmargins._central_jacobian` and Nocedal & Wright,
+:func:`~smmargins.utils._central_jacobian` and Nocedal & Wright,
 *Numerical Optimization* (2006), Chapter 8.
 
-The two paths agree to FD tolerance — there is a parity test that
-runs every public API call on three different model classes with
-``analytic=True`` and ``analytic=False`` and checks the estimates and
-SEs match.
+- **Analytic-vs-FD parity matrix.** Every public API call (AAP, APM,
+  APR, AME, MEM, MER — continuous and discrete) is run twice on each
+  of OLS+poly, Logit+`C(grp)`, Poisson, and MNLogit, with `analytic=True`
+  and `analytic=False`, and the two paths must agree on both estimate and
+  SE. This guards against the analytic chain-rule formula drifting
+  from the FD answer that the other tests pin to Stata /
+  `get_margeff`.
 
 Why the response scale matters for DiD (Ai & Norton 2003)
 ---------------------------------------------------------

@@ -171,19 +171,19 @@ M = Margins(fit, analytic=False)  # force central finite differences everywhere
    $\frac{1}{n}\sum_i f'(x_i^\top\beta)\,x_i$. We obtain $f'$
    analytically for any GLM via `family.link.inverse_deriv` (Logit,
    Probit, Poisson, NegBin, Gamma, Gaussian) and via the identity link
-   for OLS/WLS/GLS. For continuous AME we still perturb the **data
+   for OLS/WLS/GLS. MNLogit uses an analytic softmax-derivative.
+   For continuous AME we still perturb the **data
    column** with central differences — patsy doesn't expose symbolic
    derivatives of basis transforms (`I(x**2)`, `bs(...)`, `cr(...)`,
    interactions) — but that's a single 2-rebuild step, independent of
-   $p$. When `family.link.inverse_deriv` is missing (custom `Link`
-   subclass), an offset/exposure is present (so $\eta\neq X\beta$), or
-   the model is neither GLM nor a linear-regression model, the entire
-   Jacobian falls back to central finite differences with
-   $h = \epsilon^{1/3}\cdot\max(|x|, 1)$ — the truncation-vs-rounding
-   sweet spot. Stata's `margins` uses FD throughout; our analytic path
-   removes $p$ forward `predict` calls per statistic without changing
-   any answer to within FD tolerance. Pass `analytic=False` to force
-   FD on every model.
+   $p$. When an analytic path is missing, an offset/exposure is
+   present (so $\eta\neq X\beta$), or the model is neither GLM nor a
+   linear-regression model, the entire Jacobian falls back to central
+   finite differences with $h = \epsilon^{1/3}\cdot\max(|x|, 1)$ — the
+   truncation-vs-rounding sweet spot. Stata's `margins` uses FD throughout;
+   our analytic path removes $p$ forward `predict` calls per statistic
+   without changing any answer to within FD tolerance. Pass `analytic=False`
+   to force FD on every model.
 
 5. **Everything goes through `model.predict(params, exog)`.** That way
    the inverse link, offsets, exposures, and any other model-specific
@@ -207,8 +207,8 @@ The test suite checks the module against:
   Poisson.
 - **Analytic-vs-FD parity matrix.** Every public API call (AAP, APM,
   APR, AME, MEM, MER — continuous and discrete) is run twice on each
-  of OLS+poly, Logit+`C(grp)`, and Poisson, with `analytic=True` and
-  `analytic=False`, and the two paths must agree on both estimate and
+  of OLS+poly, Logit+`C(grp)`, Poisson, and MNLogit, with `analytic=True`
+  and `analytic=False`, and the two paths must agree on both estimate and
   SE. This guards against the analytic chain-rule formula drifting
   from the FD answer that the other tests pin to Stata /
   `get_margeff`.

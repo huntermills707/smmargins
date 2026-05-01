@@ -7,7 +7,7 @@ packages = ["smmargins"]
 
 [project]
 name = "smmargins"
-version = "0.1.0"
+version = "0.2.0"
 description = "Marginal effects for StatsModels"
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -15,4 +15,4 @@ API reference
     Margins
     MarginsResult
     DiDResult
-    _central_jacobian
+    utils._central_jacobian

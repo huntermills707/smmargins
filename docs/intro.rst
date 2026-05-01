@@ -36,12 +36,46 @@ StatsModels ships ``Results.get_margeff``, but it is limited:
 - :meth:`~smmargins.Margins.did` — 2x2 difference-in-differences on the
   response scale, with the joint covariance baked in;
 - :meth:`~smmargins.MarginsResult.contrast` — exact linear combinations
-  of any result, reusing the joint covariance.
+  of any result, reusing the joint covariance;
+- **Multi-outcome support** for ``MNLogit`` and ``OrderedModel``.
+
+Multi-outcome models
+--------------------
+
+``smmargins`` supports ``statsmodels.MNLogit`` (multinomial logit) and
+``statsmodels.miscmodels.ordinal_model.OrderedModel`` (ordered logit/probit).
+For these models every statistic returns one value per outcome class — ``K``
+values in place of the usual scalar — with full joint covariance across
+both rows and classes.
+
+.. code-block:: python
+
+    ame = M.dydx("x1")          # AME of x1 on each class probability; K rows
+    ame.summary()               # long-format DataFrame with `outcome` column
+
+    # Subset to specific outcomes
+    M.predict(outcome=1)               # only class 1
+    M.predict(outcome="versicolor")    # by label, if labeled
+
+Difference-in-differences
+-------------------------
+
+Two small additions turn the module into a full DiD estimator:
+
+- :meth:`~smmargins.MarginsResult.contrast` forms any linear combination
+  of the estimates directly on the already-computed joint covariance.
+- :meth:`~smmargins.Margins.did` sets up the 2x2 grid and returns a
+  :class:`~smmargins.DiDResult` bundling the four cell predictions, the
+  two simple effects, and the DiD — all sharing the same joint covariance.
+
+For **multi-outcome models**, ``did()`` returns a ``DiDResult`` where
+every field carries the K-outcome axis. The DiD contains K estimates
+whose sum is exactly zero.
 
 Installation
 ------------
 
-::
+.. code-block:: bash
 
     pip install smmargins
 
