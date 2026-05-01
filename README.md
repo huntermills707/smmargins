@@ -105,6 +105,7 @@ M.dydx("x1", method="eyex")                       # full elasticity:    ey/ex = 
 M.dydx("x1", method="dyex")                       # semi-elasticity:    dy/ex = (dy/dx)·x
 M.dydx("x1", method="eydx")                       # semi-elasticity:    ey/dx = (dy/dx)/y
 # Combine with at=/atexog= as usual; raises on discrete variables.
+# On multi-outcome models returns one elasticity per outcome class.
 
 # --- factor handling at evaluation points ---
 M.predict(at="mean")                              # factor dummies at observed proportions (Stata default)
@@ -190,7 +191,7 @@ M = Margins(fit, analytic=False)  # force central finite differences everywhere
 
 ## Verification
 
-`test_margins.py` checks the module against:
+The test suite checks the module against:
 
 - An **OLS with polynomial + interaction**, where the analytic AME is
   $\beta_1 + 2\beta_2\,\overline{x_1} + \beta_4\,\overline{x_2}$ and its
@@ -218,6 +219,57 @@ M = Margins(fit, analytic=False)  # force central finite differences everywhere
   $\mathrm{ey/ex}(x_1)=\beta_1\,\overline{x_1}$ for the canonical-link
   case. Elasticities on a discrete variable raise.
 
+## Multi-outcome models
+
+`smmargins` supports `statsmodels.MNLogit` (multinomial logit) and
+`statsmodels.miscmodels.ordinal_model.OrderedModel` (ordered logit/probit).
+For these models every statistic returns one value per outcome class — `K`
+values in place of the usual scalar — with full joint covariance across
+both rows and classes.
+
+```python
+import statsmodels.api as sm
+from smmargins import Margins
+
+fit = sm.MNLogit(y, X).fit()
+M = Margins(fit)
+
+M.n_outcomes        # K — detected automatically
+M.outcome_labels    # class labels from the fit (or numeric fallback)
+
+res = M.predict()           # AAP per class; K rows
+res.summary()               # long-format DataFrame with `outcome` column
+res.estimate.sum()          # 1.0 — class probabilities at AAP sum to one
+
+ame = M.dydx("x1")          # AME of x1 on each class probability; K rows
+ame = M.dydx(["x1", "x2"])  # 2*K rows; full joint vcov across vars × classes
+```
+
+Subset to specific outcomes via the `outcome=` kwarg, or post-hoc with
+`MarginsResult.outcome(k)` (which preserves the corresponding sub-block of
+the joint covariance):
+
+```python
+M.predict(outcome=1)               # only class 1
+M.predict(outcome=[0, 2])          # classes 0 and 2
+M.dydx("x1", outcome="versicolor") # by label, if labeled
+
+res = M.predict()
+res.outcome(2)                     # slice an existing result
+```
+
+Single-outcome models silently ignore `outcome=`, so the same code paths
+work uniformly across model classes.
+
+**Implementation.** MNLogit uses an analytic softmax-derivative gradient
+(no extra forward `predict` calls per parameter), exact to within FD
+tolerance against `statsmodels.get_margeff` on AME/MEM. OrderedModel uses
+central finite differences — the cumulative-link parameterization with the
+log-difference threshold deltas is left to a future release. Elasticity
+methods (`method="eyex" | "dyex" | "eydx"`) work on multi-outcome models
+and emit a `RuntimeWarning` when any predicted class probability falls
+below `1e-12` (where elasticities are numerically unstable).
+
 ## Difference-in-differences
 
 Two small additions turn the module into a full DiD estimator:
@@ -242,11 +294,20 @@ res.did.ci_lower    # lower 95% CI
 res.cells.vcov      # 4x4 joint covariance of the cell predictions
 ```
 
+For **multi-outcome models** (MNLogit, OrderedModel), `did()` returns a
+`DiDResult` where every field carries the K-outcome axis.  The four cells
+contain K probabilities each (summing to 1 per profile), the simple effects
+contain 2*K estimates, and the DiD contains K estimates whose sum is exactly
+zero.  The `joint` field preserves the full (3*K, 3*K) covariance, so you can
+form cross-outcome contrasts such as "DiD on P(class=1) minus DiD on
+P(class=0)" via `res.joint.contrast(...)`.  Use `res.outcome(k)` to slice the
+entire bundle to a single outcome class.
+
 **Why this matters for nonlinear models (Ai & Norton, 2003).** In a
 logit, the coefficient on the `group × condition` interaction is on the
 *log-odds* scale. On the *probability* scale the DiD is a nonlinear
 function of every parameter and every covariate profile — you cannot
-read it off the interaction coefficient. `test_did.py` verifies:
+read it off the interaction coefficient. The test suite verifies:
 
 - On **OLS**, `did()` returns exactly the interaction coefficient with
   exactly its SE (matches to 1e-8).
@@ -255,14 +316,15 @@ read it off the interaction coefficient. `test_did.py` verifies:
   probability in one test run), and matches a by-hand four-cell
   computation to 1e-10.
 
-## Changelog
-
 See [CHANGELOG.md](CHANGELOG.md).
 
 ## Files
 
-- `smmargins.py` — the module.
-- `test_margins.py`    — correctness tests for predictions and marginal effects.
-- `test_did.py`        — correctness tests for DiD and contrasts.
+- `smmargins/`        — the package directory.
+  - `core.py`         — the main `Margins` class.
+  - `data.py`         — data profiling and `patsy` integration.
+  - `results.py`      - `MarginsResult` and `DiDResult` containers.
+  - `utils.py`        — math helpers and Jacobian primitives.
+- `tests/`            — test suite (split by functionality).
 - `demo_margins.py`    — Williams-style walkthrough on a simulated dataset.
 - `demo_did.py`        — healthcare-style 2×2 DiD walkthrough.

@@ -4,7 +4,7 @@ demo_margins.py
 
 Walkthrough of the core analyses in Richard Williams' *Margins01* notes
 (https://academicweb.nd.edu/~rwilliam/stats/Margins01.pdf), implemented
-on top of StatsModels + patsy + the ``marginal_effects`` module.
+on top of StatsModels + patsy + the ``smmargins`` package.
 
 We'll reproduce, in turn:
 
