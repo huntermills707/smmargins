@@ -737,15 +737,26 @@ class Margins:
             # Sanity check alignment
             n_exog = self.model.exog.shape[1]
             n_params = self.params.size
-            if n_exog != n_params:
+            # Multi-outcome models have more parameters than exog columns
+            expected_params = n_exog
+            if hasattr(self.model, "J"):
+                # MNLogit: params shape (p, K-1) -> p*(K-1) flat
+                expected_params = n_exog * (self.model.J - 1)
+            elif hasattr(self.model, "k_extra"):
+                # OrderedModel: p + (K-1) thresholds
+                expected_params = n_exog + self.model.k_extra
+            if n_params != expected_params:
                 raise ValueError(
-                    f"Model has {n_exog} exog columns but {n_params} parameters. "
-                    "Cannot use raw mode."
+                    f"Model has {n_exog} exog columns but {n_params} parameters "
+                    f"(expected {expected_params}). Cannot use raw mode."
                 )
-            if len(self.model.exog_names) != n_params:
+            # exog_names may include threshold parameters for OrderedModel,
+            # so only validate the first n_exog names match the data columns.
+            exog_names = list(self.model.exog_names)
+            if len(exog_names) < n_exog:
                 raise ValueError(
-                    f"Model has {len(self.model.exog_names)} exog_names but "
-                    f"{n_params} parameters. Cannot use raw mode."
+                    f"Model has {len(exog_names)} exog_names but "
+                    f"{n_exog} exog columns. Cannot use raw mode."
                 )
 
         # Cache training offset/exposure for _predict broadcasting on smaller
@@ -759,6 +770,74 @@ class Margins:
         self._n_train = (self.model.exog.shape[0]
                          if getattr(self.model, "exog", None) is not None else None)
         self._mean_log_offset_value = self._compute_mean_log_offset()
+
+        # Detect number of outcome classes for multi-outcome models
+        self._n_outcomes = self._detect_n_outcomes()
+        self._outcome_labels = self._detect_outcome_labels()
+
+    def _detect_n_outcomes(self) -> int:
+        """Detect the number of outcome classes (K) for the fitted model.
+
+        Returns
+        -------
+        int
+            Number of outcome classes. 1 for single-outcome models.
+        """
+        # MNLogit
+        if hasattr(self.model, "J"):
+            return int(self.model.J)
+        # OrderedModel
+        if hasattr(self.model, "k_extra"):
+            return int(self.model.k_extra) + 1
+        # Last resort: probe with a 1-row prediction
+        try:
+            exog = getattr(self.model, "exog", None)
+            if exog is not None and exog.shape[0] > 0:
+                probe = exog[:1]
+                pred = self.model.predict(self.results.params, probe)
+                pred_arr = np.asarray(pred)
+                if pred_arr.ndim == 2:
+                    return pred_arr.shape[1]
+        except Exception:
+            pass
+        return 1
+
+    def _detect_outcome_labels(self) -> Optional[List[str]]:
+        """Detect outcome class labels for multi-outcome models.
+
+        Returns
+        -------
+        list of str or None
+            Labels for each outcome class, or None for single-outcome models.
+        """
+        if self._n_outcomes == 1:
+            return None
+        # MNLogit
+        ynames = getattr(self.model, "_ynames_map", None)
+        if ynames is not None:
+            # ynames_map maps class index -> label
+            labels = [str(ynames.get(i, i)) for i in range(self._n_outcomes)]
+            return labels
+        # Try to infer from endog
+        endog = getattr(self.model, "endog", None)
+        if endog is not None:
+            try:
+                uniq = np.unique(endog)
+                if len(uniq) == self._n_outcomes:
+                    return [str(u) for u in uniq]
+            except Exception:
+                pass
+        return [str(i) for i in range(self._n_outcomes)]
+
+    @property
+    def n_outcomes(self) -> int:
+        """Number of outcome classes (K) for the fitted model."""
+        return self._n_outcomes
+
+    @property
+    def outcome_labels(self) -> Optional[List[str]]:
+        """Outcome class labels for multi-outcome models, or None."""
+        return self._outcome_labels
 
     def _compute_mean_log_offset(self) -> Optional[float]:
         """Mean of (offset + log(exposure)) across the training sample.
@@ -815,7 +894,12 @@ class Margins:
         try:
             return self.model.data.frame
         except AttributeError:
-            return None
+            pass
+        # Some models (e.g. MNLogit, OrderedModel) store the data in orig_exog
+        orig_exog = getattr(self.model.data, "orig_exog", None)
+        if orig_exog is not None and hasattr(orig_exog, "columns"):
+            return pd.DataFrame(orig_exog)
+        return None
 
     def _try_get_design_info(self):
         """Retrieve the patsy DesignInfo from the model, if available.

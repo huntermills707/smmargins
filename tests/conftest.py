@@ -54,6 +54,60 @@ def poisson_fit(sim_frame):
                    family=sm.families.Poisson()).fit()
 
 
+@pytest.fixture(scope="session")
+def mnlogit_frame(rng):
+    """Data frame for a 3-class MNLogit."""
+    n = 500
+    df = pd.DataFrame({
+        "x1": rng.normal(0, 1, n),
+        "x2": rng.normal(0, 1, n),
+    })
+    eta = np.column_stack([
+        np.zeros(n),
+        0.5 + df["x1"] - 0.3 * df["x2"],
+        -0.2 + 0.4 * df["x1"] + 0.1 * df["x2"],
+    ])
+    probs = np.exp(eta) / np.exp(eta).sum(axis=1, keepdims=True)
+    df["y_mnl"] = np.array([rng.choice([0, 1, 2], p=p) for p in probs])
+    return df
+
+
+@pytest.fixture(scope="session")
+def mnlogit_fit(mnlogit_frame):
+    return sm.MNLogit(mnlogit_frame["y_mnl"],
+                      sm.add_constant(mnlogit_frame[["x1", "x2"]])).fit(disp=False)
+
+
+@pytest.fixture(scope="session")
+def ordered_frame(rng):
+    """Data frame for a 4-category ordered logit."""
+    n = 500
+    df = pd.DataFrame({
+        "x1": rng.normal(0, 1, n),
+        "x2": rng.normal(0, 1, n),
+    })
+    eta = 0.5 + 0.3 * df["x1"] - 0.2 * df["x2"]
+    thresholds = [-0.5, 0.0, 0.5]
+    probs = np.zeros((n, 4))
+    probs[:, 0] = 1 / (1 + np.exp(-(thresholds[0] - eta)))
+    for k in range(1, 3):
+        probs[:, k] = (
+            1 / (1 + np.exp(-(thresholds[k] - eta)))
+            - 1 / (1 + np.exp(-(thresholds[k - 1] - eta)))
+        )
+    probs[:, 3] = 1 - probs[:, :3].sum(axis=1)
+    df["y_ord"] = np.array([rng.choice([0, 1, 2, 3], p=p) for p in probs])
+    return df
+
+
+@pytest.fixture(scope="session")
+def ordered_fit(ordered_frame):
+    from statsmodels.miscmodels.ordinal_model import OrderedModel
+    return OrderedModel(
+        ordered_frame["y_ord"], ordered_frame[["x1", "x2"]], distr="logit"
+    ).fit(disp=False)
+
+
 @pytest.fixture(scope="function")
 def did_frame(rng):
     """The (treat, post, x) frame used in DiD tests."""
