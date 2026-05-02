@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-05-01
+
+### Added
+
+- **Custom covariance input** (`cov_type=`, `vcov=`): `Margins` now accepts
+  `cov_type` (e.g. `"HC0"`–`"HC3"`, `"cluster"`, `"HAC"`) and/or `vcov` (a
+  user-supplied matrix) to override the default `results.cov_params()`.
+  `cov_kwds=` passes through additional arguments such as cluster groups.
+  `cov_type` and `vcov` are mutually exclusive. Implemented via the shared
+  `_get_param_cov()` helper in `utils.py`.
+- **Krinsky–Robb simulation VCE** (`vce="simulation"`): Draws parameter vectors
+  from a multivariate normal and evaluates the margin function for each draw.
+  Keeps the analytic point estimate; uses draws only for SEs and percentile
+  CIs. Composes naturally with `cov_type=` (e.g. `vce="simulation",
+  cov_type="HC1"`). Controlled by `n_sims=` (default 2000) and `sim_seed=`.
+- **Bootstrap VCE** (`vce="bootstrap"`): Pairs, cluster, and moving-block
+  bootstrap are supported via `boot_method=` (`"pairs"`, `"cluster"`,
+  `"block"`). Refits the model on each bootstrap sample generically using the
+  original model class. Convergence failures are caught, counted, and warned
+  if >5% of reps fail. Optional `verbose=True` progress bar and `n_jobs`
+  parallelization via `joblib` (falls back to serial if unavailable).
+- **Simultaneous confidence intervals** (`ci_method=`): Four methods are
+  available — `"pointwise"` (default), `"bonferroni"`, `"sidak"`, and
+  `"sup-t"`. Bonferroni and Sidak are pure critical-value adjustments that
+  work with any VCE. Sup-t consumes the draw matrix from simulation or
+  bootstrap and computes the quantile of the maximum standardized absolute
+  deviation across the margin family. The "family" is the set of margins
+  returned by a single `margins()` call.
+- New `smmargins/inference.py` module housing `_simulate_vce()`,
+  `_bootstrap_vce()`, and the shared `_refit_model()` bootstrap refit logic.
+- **External parity tests against R `marginaleffects`** under
+  `tests/comparison/`. A checked-in `generate_r.R` script produces six
+  reference CSVs (regenerable with `Rscript generate_r.R` once
+  `marginaleffects`, `readr`, and `sandwich` are installed); `test_r.py`
+  asserts smmargins reproduces them to documented precision:
+
+  | Case                                       | Estimate tol | SE tol           |
+  | ------------------------------------------ | ------------ | ---------------- |
+  | Logit AME, HC3                             | 1e-6         | 5e-5             |
+  | Poisson AME, HC3                           | 1e-6         | 5e-4             |
+  | OLS pairs bootstrap (n_boot=1000)          | 1e-10        | Monte-Carlo (5σ) |
+  | OLS with HC1, polynomial + interaction     | 1e-6         | 1e-6             |
+  | Logit cluster-robust AME                   | 1e-5         | 1e-4             |
+  | Logit AME at representative `x2` values    | 1e-5         | 1e-4             |
+
+  Tests are auto-skipped when the reference CSVs are absent, so the suite
+  stays green for users without R installed. Stata reference outputs were
+  considered but dropped in favour of the R path because
+  `marginaleffects` covers every comparison Stata's `margins` does and is
+  free / scriptable in CI.
+
+### Changed
+
+- `Margins.__init__` now accepts `cov_type`, `vcov`, and `cov_kwds`.
+- `Margins.predict()`, `Margins.dydx()`, and `Margins.did()` accept the full
+  unified VCE/CI kwarg surface: `vce`, `cov_type`, `vcov`, `cov_kwds`,
+  `n_sims`, `sim_seed`, `n_boot`, `boot_seed`, `boot_method`, `cluster`,
+  `block_size`, `verbose`, `n_jobs`, `ci_method`, `ci_alpha`.
+- `MarginsResult` now stores `ci_method`, `draws`, and computes `se` from
+  draws when available. `ci_lower`/`ci_upper` use percentile CIs for
+  pointwise simulation/bootstrap and critical-value adjustments for
+  Bonferroni/Sidak/sup-t. `MarginsResult.contrast()` propagates `ci_method`
+  and `draws` to the contrasted result.
+- `Margins._delta` is now the unified inference worker supporting delta,
+  simulation, and bootstrap VCE in one code path.
+
 ## [0.2.0] - 2026-05-01
 
 ### Added

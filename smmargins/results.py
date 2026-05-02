@@ -5,6 +5,7 @@ import pandas as pd
 from scipy import stats
 from typing import Optional, Union, Sequence, List
 
+
 class MarginsResult:
     """Container for marginal effects or adjusted predictions.
 
@@ -17,15 +18,22 @@ class MarginsResult:
     estimate : ndarray
         Point estimates for each margin.
     vcov : ndarray
-        The estimated covariance matrix of the margins (delta method).
+        The estimated covariance matrix of the margins (delta method
+        or empirical covariance of simulation/bootstrap draws).
     se : ndarray
-        Standard errors (square root of the diagonal of ``vcov``).
+        Standard errors (square root of the diagonal of ``vcov``, or
+        the standard deviation of draws when available).
     tvalues : ndarray
         Test statistics (estimate / se).
     pvalues : ndarray
         Two-sided p-values based on either the normal or t distribution.
     labels : list of str
         Labels for each row of the results.
+    ci_method : str
+        Method used to compute confidence intervals ("pointwise",
+        "bonferroni", "sidak", or "sup-t").
+    draws : ndarray or None
+        Simulation/bootstrap draw matrix of shape (S, m) when available.
     """
 
     def __init__(
@@ -38,6 +46,8 @@ class MarginsResult:
         stat_name: str = "margin",
         outcome_labels: Optional[Sequence[str]] = None,
         outcome_index: Optional[np.ndarray] = None,
+        ci_method: str = "pointwise",
+        draws: Optional[np.ndarray] = None,
     ):
         self.estimate = np.asarray(estimate)
         self.vcov = np.asarray(vcov)
@@ -47,9 +57,13 @@ class MarginsResult:
         self.stat_name = stat_name
         self.outcome_labels = list(outcome_labels) if outcome_labels is not None else None
         self.outcome_index = np.asarray(outcome_index) if outcome_index is not None else None
+        self.ci_method = ci_method
+        self.draws = draws
 
     @property
     def se(self) -> np.ndarray:
+        if self.draws is not None:
+            return np.std(self.draws, axis=0, ddof=1)
         return np.sqrt(np.maximum(np.diag(self.vcov), 0))
 
     @property
@@ -62,22 +76,59 @@ class MarginsResult:
             return 2 * stats.t.sf(np.abs(self.tvalues), self.df)
         return 2 * stats.norm.sf(np.abs(self.tvalues))
 
+    def _crit_value(self) -> float:
+        """Critical value for confidence intervals."""
+        alpha = 1 - self.level
+        m = len(self.estimate)
+        if self.ci_method == "bonferroni":
+            alpha_adj = alpha / m
+        elif self.ci_method == "sidak":
+            alpha_adj = 1 - (1 - alpha) ** (1 / m)
+        elif self.ci_method == "sup-t":
+            if self.draws is None:
+                raise ValueError(
+                    "sup-t requires draws (use vce='simulation' or 'bootstrap')"
+                )
+            se_draws = np.std(self.draws, axis=0, ddof=1)
+            valid = se_draws > 1e-14
+            if not np.any(valid):
+                return np.inf
+            # Standardize deviations around the analytic point estimate
+            # (conservative relative to centering on the draw mean).
+            devs = np.abs(self.draws[:, valid] - self.estimate[None, valid]) / se_draws[None, valid]
+            sup_devs = np.max(devs, axis=1)
+            return float(np.quantile(sup_devs, 1 - alpha))
+        else:  # pointwise
+            alpha_adj = alpha
+
+        if self.df is not None:
+            return float(stats.t.ppf(1 - alpha_adj / 2, self.df))
+        return float(stats.norm.ppf(1 - alpha_adj / 2))
+
     @property
     def ci_lower(self) -> np.ndarray:
-        alpha = 1 - self.level
-        if self.df is not None:
-            crit = stats.t.ppf(1 - alpha / 2, self.df)
-        else:
-            crit = stats.norm.ppf(1 - alpha / 2)
+        """Lower confidence bound.
+
+        For ``ci_method="pointwise"`` with simulation/bootstrap draws,
+        returns an empirical percentile (asymmetric) rather than the
+        symmetric ``estimate - crit * se`` used for delta-method VCE.
+        """
+        if self.ci_method == "pointwise" and self.draws is not None:
+            return np.percentile(self.draws, 100 * (1 - self.level) / 2, axis=0)
+        crit = self._crit_value()
         return self.estimate - crit * self.se
 
     @property
     def ci_upper(self) -> np.ndarray:
-        alpha = 1 - self.level
-        if self.df is not None:
-            crit = stats.t.ppf(1 - alpha / 2, self.df)
-        else:
-            crit = stats.norm.ppf(1 - alpha / 2)
+        """Upper confidence bound.
+
+        For ``ci_method="pointwise"`` with simulation/bootstrap draws,
+        returns an empirical percentile (asymmetric) rather than the
+        symmetric ``estimate + crit * se`` used for delta-method VCE.
+        """
+        if self.ci_method == "pointwise" and self.draws is not None:
+            return np.percentile(self.draws, 100 * (1 + self.level) / 2, axis=0)
+        crit = self._crit_value()
         return self.estimate + crit * self.se
 
     def contrast(
@@ -122,9 +173,14 @@ class MarginsResult:
 
         est = C @ self.estimate
         vcov = C @ self.vcov @ C.T
+        draws = None
+        if self.draws is not None:
+            draws = self.draws @ C.T
         return MarginsResult(
             estimate=est, vcov=vcov, labels=labels,
             level=self.level, df=self.df, stat_name=name,
+            ci_method=self.ci_method,
+            draws=draws,
         )
 
     def outcome(self, k: Union[int, str, Sequence[Union[int, str]]]) -> "MarginsResult":
@@ -161,6 +217,7 @@ class MarginsResult:
         if not np.any(mask):
             raise ValueError(f"No rows found for outcome(s) {keys}")
 
+        draws = self.draws[:, mask] if self.draws is not None else None
         return MarginsResult(
             estimate=self.estimate[mask],
             vcov=self.vcov[np.ix_(mask, mask)],
@@ -170,6 +227,8 @@ class MarginsResult:
             stat_name=self.stat_name,
             outcome_labels=self.outcome_labels,
             outcome_index=self.outcome_index[mask],
+            ci_method=self.ci_method,
+            draws=draws,
         )
 
     def summary(self) -> pd.DataFrame:
@@ -186,6 +245,7 @@ class MarginsResult:
 
     def __repr__(self) -> str:
         return self.summary().to_string()
+
 
 class DiDResult:
     """Container for difference-in-differences results.

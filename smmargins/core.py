@@ -10,17 +10,20 @@ import patsy
 
 from .results import MarginsResult, DiDResult
 from .data import _Profile
-from .utils import _central_jacobian, _METHOD_META
+from .utils import _central_jacobian, _METHOD_META, _get_param_cov
+from .inference import _simulate_vce, _bootstrap_vce, _summarize_draws
 
 class Margins:
     r"""Compute adjusted predictions and marginal effects for a StatsModels fit.
 
-    Rather than hand-differentiating each model's linear predictor / link
-    combination, every statistic is built as a *function of*
-    :math:`\beta` using ``model.predict(params, exog)`` (which handles
-    the inverse link). The Jacobian of that function is taken by central
-    finite differences, and the delta method is applied with
-    ``results.cov_params()``.
+    Every statistic is built as a *function of* :math:`\beta` using
+    ``model.predict(params, exog)`` (which handles the inverse link).
+    The default delta-method VCE applies ``J Var(\betâ) J^\top`` where
+    ``J`` is taken analytically when the link supports it (``family.link
+    .inverse_deriv`` or the identity link of OLS/WLS/GLS) and by central
+    finite differences otherwise. Krinsky–Robb and bootstrap VCEs are
+    available via ``vce=`` on :meth:`predict`, :meth:`dydx`, and
+    :meth:`did`.
 
     Parameters
     ----------
@@ -40,6 +43,23 @@ class Margins:
         derivative (any GLM via ``family.link.inverse_deriv``, plus
         ``OLS``/``WLS``/``GLS`` via the identity link). Falls back to central
         finite differences otherwise. Set to False to force FD everywhere.
+    cov_type : str, optional
+        Recompute the parameter covariance under this scheme (e.g.
+        ``"HC0"``..``"HC3"``, ``"cluster"``, ``"HAC"``). Passed through
+        to ``results.get_robustcov_results`` (or equivalent). If neither
+        ``cov_type`` nor ``vcov`` is set, ``results.cov_params()`` is used
+        as-is — so a ``results`` object that was fit with a robust
+        ``cov_type`` keeps its sandwich. Setting ``cov_type`` here
+        overrides whatever is on ``results``. The same kwargs are also
+        accepted on :meth:`predict`, :meth:`dydx`, and :meth:`did` for
+        per-call overrides.
+    vcov : ndarray, optional
+        User-supplied :math:`(k, k)` parameter covariance, used directly
+        as ``Var(\betâ)``. Mutually exclusive with ``cov_type`` —
+        passing both raises ``ValueError``.
+    cov_kwds : dict, optional
+        Extra keyword arguments forwarded to the covariance computation.
+        Most importantly, ``{"groups": ...}`` for ``cov_type="cluster"``.
 
     Notes
     -----
@@ -67,6 +87,28 @@ class Margins:
 
         \widehat{\mathrm{Var}}[g(\hat\beta)] \approx
         G \, \widehat V \, G^\top .
+
+    **Inference options**
+
+    Each of :meth:`predict`, :meth:`dydx`, and :meth:`did` accepts a
+    common block of inference kwargs:
+
+    - ``vce``: ``"delta"`` (default), ``"simulation"`` (Krinsky–Robb,
+      ``n_sims`` draws of :math:`\beta_s \sim N(\hat\beta, \hat V)`),
+      or ``"bootstrap"`` (refit on resampled rows; supports
+      ``boot_method="pairs"|"cluster"|"block"``).
+    - ``cov_type``/``vcov``/``cov_kwds``: same meaning as on the
+      constructor, but applied per-call and overriding what's on
+      ``self``.
+    - ``ci_method``: ``"pointwise"`` (default), ``"bonferroni"``,
+      ``"sidak"``, or ``"sup-t"``. The first three are post-hoc
+      adjustments to the critical value; ``"sup-t"`` consumes the
+      simulation/bootstrap draw matrix and so requires
+      ``vce != "delta"``.
+
+    The point estimate reported is always the analytic
+    :math:`g(\hat\beta)` from the original fit, even under simulation
+    or bootstrap — draws contribute only to SEs and intervals.
 
     Examples
     --------
@@ -96,6 +138,23 @@ class Margins:
         M.dydx("educ", reference="college")        # discrete contrasts
         M.dydx("kids", count=True)                 # x -> x+1 for integers
         M.dydx("age", method="eyex")               # full elasticity
+
+    Robust SEs and alternative VCEs::
+
+        M.dydx("age", cov_type="HC3")              # heteroskedastic-robust
+        M.dydx("age", cov_type="cluster",
+               cov_kwds={"groups": df["clust"]})    # cluster-robust
+        M.dydx("age", vce="simulation",
+               n_sims=2000, sim_seed=0)            # Krinsky–Robb
+        M.dydx("age", vce="bootstrap",
+               n_boot=1000, boot_seed=0)           # pairs bootstrap
+
+    Multiple-comparison adjustments for a family of margins::
+
+        M.dydx(["age", "income"], ci_method="bonferroni")
+        M.predict(atexog={"age": [25, 45, 65]},
+                  vce="simulation", n_sims=2000,
+                  ci_method="sup-t")
 
     Most calls return a :class:`MarginsResult` whose ``__repr__`` prints
     a tidy table of estimates, SEs, z- (or t-) statistics, p-values, and
@@ -144,6 +203,9 @@ class Margins:
         level: float = 0.95,
         use_t: bool = False,
         analytic: bool = True,
+        cov_type: Optional[str] = None,
+        vcov: Optional[np.ndarray] = None,
+        cov_kwds: Optional[dict] = None,
     ):
         self.results = results
         self.model = results.model
@@ -155,7 +217,7 @@ class Margins:
             self.params = params_arr.ravel(order="F")
         else:
             self.params = params_arr.ravel()
-        self.cov = np.asarray(results.cov_params(), dtype=float)
+        self.cov = _get_param_cov(results, cov_type=cov_type, vcov=vcov, cov_kwds=cov_kwds)
         if self.cov.shape != (self.params.size, self.params.size):
             raise ValueError(
                 f"cov_params has shape {self.cov.shape}, expected "
@@ -1029,7 +1091,7 @@ class Margins:
             "zero":    "zero",  # reference level — matches at='zero' semantics
         }[at]
 
-    # ---- the delta-method worker ----
+    # ---- the inference worker ----
 
     def _delta(
         self,
@@ -1038,44 +1100,41 @@ class Margins:
         stat_name: str,
         jac: Optional[Callable[[np.ndarray], np.ndarray]] = None,
         outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
+        vce: str = "delta",
+        cov_type: Optional[str] = None,
+        vcov: Optional[np.ndarray] = None,
+        cov_kwds: Optional[dict] = None,
+        n_sims: int = 2000,
+        sim_seed: Optional[int] = None,
+        n_boot: int = 1000,
+        boot_seed: Optional[int] = None,
+        boot_method: str = "pairs",
+        cluster: Optional[np.ndarray] = None,
+        block_size: Optional[int] = None,
+        verbose: bool = False,
+        n_jobs: int = 1,
+        ci_method: str = "pointwise",
+        ci_alpha: float = 0.05,
+        _margin_factory: Optional[Callable] = None,
     ) -> MarginsResult:
-        r"""Apply the delta method to a vector-valued statistic.
+        r"""Apply inference to a vector-valued statistic.
 
-        Computes :math:`\hat\theta = g(\hat\beta)` and its delta-method
-        covariance :math:`\widehat{\operatorname{Var}}(\hat\theta) = J V J^\top`,
-        where :math:`J = \partial g / \partial \beta` is either supplied
-        analytically or obtained by central finite differences.
-
-        Parameters
-        ----------
-        statistic : callable
-            Function mapping a parameter vector :math:`\beta` to a vector
-            of statistic values.
-        labels : sequence of str
-            Row labels for each component of the statistic.
-        stat_name : str
-            Column name to use in the summary table.
-        jac : callable, optional
-            Function returning the analytic Jacobian matrix
-            :math:`\partial g / \partial \beta`. If ``None``, the Jacobian
-            is computed numerically via ``_central_jacobian``.
-
-        Returns
-        -------
-        MarginsResult
-            Estimates with delta-method standard errors and confidence
-            intervals.
-
-        Notes
-        -----
-        This is the core inference primitive shared by every public API
-        method (``predict``, ``dydx``, ``did``).
-
-        For multi-outcome models, the statistic returns shape ``(m, K)``.
-        The estimate is flattened row-major (outcome varies fastest) and
-        labels are expanded to ``m * K`` entries. The Jacobian is expected
-        to already be ``(m*K, p)``.
+        Supports delta-method, Krinsky–Robb simulation, and bootstrap VCE.
         """
+        if vce not in ("delta", "simulation", "bootstrap"):
+            raise ValueError(
+                f"vce must be 'delta', 'simulation', or 'bootstrap', got {vce!r}"
+            )
+        if ci_method not in ("pointwise", "bonferroni", "sidak", "sup-t"):
+            raise ValueError(
+                f"ci_method must be 'pointwise', 'bonferroni', 'sidak', or 'sup-t', "
+                f"got {ci_method!r}"
+            )
+        if ci_method == "sup-t" and vce == "delta":
+            raise ValueError(
+                "sup-t requires draws (use vce='simulation' or 'bootstrap')"
+            )
+
         beta = self.params
         est_val = statistic(beta)
         est_arr = np.asarray(est_val, dtype=float)
@@ -1086,7 +1145,6 @@ class Margins:
         if est_arr.ndim == 2 and est_arr.shape[1] > 1:
             m, K = est_arr.shape
             est = est_arr.ravel()
-            # Expand labels: each base label repeated K times with outcome suffix
             expanded_labels: List[str] = []
             for lab in labels:
                 for k in range(K):
@@ -1102,16 +1160,8 @@ class Margins:
         else:
             est = est_arr.ravel()
 
-        if jac is not None:
-            J = np.atleast_2d(np.asarray(jac(beta), dtype=float))
-        else:
-            # We must pass the user-provided 'statistic' directly to the
-            # numerical differentiator.
-            J = _central_jacobian(statistic, beta)
-
-        V = J @ self.cov @ J.T
-
         # Apply outcome subsetting if requested
+        mask = None
         if outcome is not None and self.n_outcomes > 1 and outcome_index is not None:
             keys = [outcome] if isinstance(outcome, (int, str)) else list(outcome)
             keep_indices: set[int] = set()
@@ -1131,17 +1181,78 @@ class Margins:
             if not np.any(mask):
                 raise ValueError(f"No rows found for outcome(s) {keys}")
             est = est[mask]
-            J = J[mask, :]
-            V = V[np.ix_(mask, mask)]
             labels = [labels[i] for i in np.where(mask)[0]]
             outcome_index = outcome_index[mask]
 
-        return MarginsResult(
-            estimate=est, vcov=V, labels=labels,
-            level=self.level, df=self.df, stat_name=stat_name,
-            outcome_labels=outcome_labels_out,
-            outcome_index=outcome_index,
-        )
+        level = 1 - ci_alpha
+
+        if vce == "delta":
+            if jac is not None:
+                J = np.atleast_2d(np.asarray(jac(beta), dtype=float))
+            else:
+                J = _central_jacobian(statistic, beta)
+            if mask is not None:
+                J = J[mask, :]
+            if cov_type is not None or vcov is not None or cov_kwds is not None:
+                param_cov = _get_param_cov(
+                    self.results, cov_type=cov_type, vcov=vcov, cov_kwds=cov_kwds
+                )
+            else:
+                param_cov = self.cov
+            V = J @ param_cov @ J.T
+            return MarginsResult(
+                estimate=est, vcov=V, labels=labels,
+                level=level, df=self.df, stat_name=stat_name,
+                outcome_labels=outcome_labels_out,
+                outcome_index=outcome_index,
+                ci_method=ci_method,
+            )
+
+        elif vce == "simulation":
+            param_cov = _get_param_cov(
+                self.results, cov_type=cov_type, vcov=vcov, cov_kwds=cov_kwds
+            )
+            draws = _simulate_vce(
+                beta, param_cov, statistic, n_sims=n_sims, seed=sim_seed
+            )
+            if mask is not None:
+                draws = draws[:, mask]
+            V, _ = _summarize_draws(draws, ddof=1)
+            return MarginsResult(
+                estimate=est, vcov=V, labels=labels,
+                level=level, df=self.df, stat_name=stat_name,
+                outcome_labels=outcome_labels_out,
+                outcome_index=outcome_index,
+                ci_method=ci_method,
+                draws=draws,
+            )
+
+        elif vce == "bootstrap":
+            if _margin_factory is None:
+                raise ValueError("bootstrap requires _margin_factory")
+            draws = _bootstrap_vce(
+                self.results,
+                _margin_factory,
+                n_boot=n_boot,
+                seed=boot_seed,
+                method=boot_method,
+                cluster=cluster,
+                block_size=block_size,
+                verbose=verbose,
+                n_jobs=n_jobs,
+            )
+            V, _ = _summarize_draws(draws, ddof=1)
+            return MarginsResult(
+                estimate=est, vcov=V, labels=labels,
+                level=level, df=self.df, stat_name=stat_name,
+                outcome_labels=outcome_labels_out,
+                outcome_index=outcome_index,
+                ci_method=ci_method,
+                draws=draws,
+            )
+
+        # Unreachable
+        raise RuntimeError(f"Unhandled vce={vce!r}")
 
     # ======================================================================}
     # Public API: adjusted predictions
@@ -1153,6 +1264,21 @@ class Margins:
             atexog: Optional[Mapping[str, object]] = None,
             factor_stat: Optional[str] = None,
             outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
+            vce: str = "delta",
+            cov_type: Optional[str] = None,
+            vcov: Optional[np.ndarray] = None,
+            cov_kwds: Optional[dict] = None,
+            n_sims: int = 2000,
+            sim_seed: Optional[int] = None,
+            n_boot: int = 1000,
+            boot_seed: Optional[int] = None,
+            boot_method: str = "pairs",
+            cluster: Optional[np.ndarray] = None,
+            block_size: Optional[int] = None,
+            verbose: bool = False,
+            n_jobs: int = 1,
+            ci_method: str = "pointwise",
+            ci_alpha: float = 0.05,
         ) -> MarginsResult:
         r"""Compute adjusted predictions (expected outcome on the response scale).
 
@@ -1194,56 +1320,46 @@ class Margins:
               individual" rather than a fictional fractional one.
             - ``"zero"``: factors at their reference (first observed)
               level.
+        outcome : int, str, or sequence, optional
+            For multi-outcome models, subset to the specified outcome
+            class(es).
+        vce : {"delta", "simulation", "bootstrap"}, default "delta"
+            Variance estimation method.
+        cov_type : str, optional
+            Recompute the parameter covariance using this covariance type
+            (e.g. "HC1", "cluster"). Passed through to statsmodels.
+        vcov : ndarray, optional
+            User-supplied parameter covariance matrix. Mutually exclusive
+            with ``cov_type``.
+        cov_kwds : dict, optional
+            Additional keywords for covariance computation (e.g.
+            ``{"groups": ...}`` for cluster).
+        n_sims : int, default 2000
+            Number of draws for Krinsky–Robb simulation.
+        sim_seed : int, optional
+            Seed for simulation draws.
+        n_boot : int, default 1000
+            Number of bootstrap replications.
+        boot_seed : int, optional
+            Seed for bootstrap resampling.
+        boot_method : {"pairs", "cluster", "block"}, default "pairs"
+            Bootstrap resampling scheme.
+        cluster : ndarray, optional
+            Cluster IDs for cluster bootstrap.
+        block_size : int, optional
+            Block size for block bootstrap.
+        verbose : bool, default False
+            Show progress bar during bootstrap.
+        n_jobs : int, default 1
+            Parallel jobs for bootstrap. Requires ``joblib``.
+        ci_method : {"pointwise", "bonferroni", "sidak", "sup-t"}, default "pointwise"
+            Confidence interval method.
+        ci_alpha : float, default 0.05
+            Significance level for confidence intervals.
 
         Returns
         -------
         MarginsResult
-
-        Notes
-        -----
-        ============================  ============================================
-        Statistic                     Call
-        ============================  ============================================
-        AAP  (avg adj. prediction)    ``predict()``
-        APM  (pred. at means)         ``predict(at="mean")``
-        APR  (pred. at rep. values)   ``predict(atexog={"x1": [0,1,2]})``
-        APR with others at means      ``predict(at="mean", atexog={"x1": [0,1,2]})``
-        ============================  ============================================
-
-        Examples
-        --------
-        Adjusted-prediction profile across ``age`` for each sex::
-
-            M.predict(atexog={"age": list(range(20, 91, 10)),
-                              "female": [0, 1]})
-
-        APM (Stata's ``margins, atmeans``) versus AAP::
-
-            M.predict(at="mean")    # factor dummies as observed proportions
-            M.predict()             # AAP — usually the more defensible default
-
-        Hold ``age`` at three policy-relevant values, average everything else
-        over the sample (Stata's ``margins, at(age=(25 45 65))``)::
-
-            M.predict(atexog={"age": [25, 45, 65]})
-
-        A runnable smoke test on a small linear model::
-
-            >>> import numpy as np, pandas as pd, statsmodels.formula.api as smf
-            >>> from smmargins import Margins
-            >>> rng = np.random.default_rng(0)
-            >>> df = pd.DataFrame({
-            ...     "x1": rng.standard_normal(50),
-            ...     "x2": rng.standard_normal(50),
-            ... })
-            >>> df["y"] = 1.0 + 2.0 * df["x1"] - df["x2"] + 0.1 * rng.standard_normal(50)
-            >>> fit = smf.ols("y ~ x1 + x2", df).fit()
-            >>> M = Margins(fit)
-            >>> M.predict(atexog={"x1": [0, 1]}).estimate.shape
-            (2,)
-            >>> bool(M.predict(atexog={"x1": [0, 1]}).estimate[1]
-            ...      > M.predict(atexog={"x1": [0]}).estimate[0])
-            True
 
         See Also
         --------
@@ -1287,9 +1403,43 @@ class Margins:
         else:
             jac = None
 
+        if vce == "bootstrap":
+            def _margin_factory(results_b):
+                M = Margins(
+                    results_b,
+                    level=self.level,
+                    use_t=self.df is not None,
+                    analytic=self.analytic,
+                )
+                return M.predict(
+                    at=at,
+                    atexog=atexog,
+                    factor_stat=factor_stat,
+                    outcome=outcome,
+                    vce="delta",
+                )
+        else:
+            _margin_factory = None
+
         return self._delta(
             statistic, labels=labels, stat_name=stat_name, jac=jac,
             outcome=outcome,
+            vce=vce,
+            cov_type=cov_type,
+            vcov=vcov,
+            cov_kwds=cov_kwds,
+            n_sims=n_sims,
+            sim_seed=sim_seed,
+            n_boot=n_boot,
+            boot_seed=boot_seed,
+            boot_method=boot_method,
+            cluster=cluster,
+            block_size=block_size,
+            verbose=verbose,
+            n_jobs=n_jobs,
+            ci_method=ci_method,
+            ci_alpha=ci_alpha,
+            _margin_factory=_margin_factory,
         )
 
     # ======================================================================}
@@ -1308,6 +1458,21 @@ class Margins:
             factor_stat: Optional[str] = None,
             method: str = "dydx",
             outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
+            vce: str = "delta",
+            cov_type: Optional[str] = None,
+            vcov: Optional[np.ndarray] = None,
+            cov_kwds: Optional[dict] = None,
+            n_sims: int = 2000,
+            sim_seed: Optional[int] = None,
+            n_boot: int = 1000,
+            boot_seed: Optional[int] = None,
+            boot_method: str = "pairs",
+            cluster: Optional[np.ndarray] = None,
+            block_size: Optional[int] = None,
+            verbose: bool = False,
+            n_jobs: int = 1,
+            ci_method: str = "pointwise",
+            ci_alpha: float = 0.05,
         ) -> MarginsResult:
         r"""Marginal effect of ``variable`` on the response.
 
@@ -1349,6 +1514,39 @@ class Margins:
             is (auto- or explicitly) discrete and ``method != "dydx"``.
             Elasticity methods always go through finite differences;
             ``analytic=True`` on the constructor only affects ``"dydx"``.
+        outcome : int, str, or sequence, optional
+            For multi-outcome models, subset to the specified outcome
+            class(es).
+        vce : {"delta", "simulation", "bootstrap"}, default "delta"
+            Variance estimation method.
+        cov_type : str, optional
+            Recompute the parameter covariance using this covariance type.
+        vcov : ndarray, optional
+            User-supplied parameter covariance matrix.
+        cov_kwds : dict, optional
+            Additional keywords for covariance computation.
+        n_sims : int, default 2000
+            Number of draws for Krinsky–Robb simulation.
+        sim_seed : int, optional
+            Seed for simulation draws.
+        n_boot : int, default 1000
+            Number of bootstrap replications.
+        boot_seed : int, optional
+            Seed for bootstrap resampling.
+        boot_method : {"pairs", "cluster", "block"}, default "pairs"
+            Bootstrap resampling scheme.
+        cluster : ndarray, optional
+            Cluster IDs for cluster bootstrap.
+        block_size : int, optional
+            Block size for block bootstrap.
+        verbose : bool, default False
+            Show progress bar during bootstrap.
+        n_jobs : int, default 1
+            Parallel jobs for bootstrap. Requires ``joblib``.
+        ci_method : {"pointwise", "bonferroni", "sidak", "sup-t"}, default "pointwise"
+            Confidence interval method.
+        ci_alpha : float, default 0.05
+            Significance level for confidence intervals.
 
         Returns
         -------
@@ -1573,9 +1771,49 @@ class Margins:
         names = {p[3] for p in parts}
         stat_name = names.pop() if len(names) == 1 else "mixed"
 
+        if vce == "bootstrap":
+            def _margin_factory(results_b):
+                M = Margins(
+                    results_b,
+                    level=self.level,
+                    use_t=self.df is not None,
+                    analytic=self.analytic,
+                )
+                return M.dydx(
+                    variable=variable,
+                    at=at,
+                    atexog=atexog,
+                    discrete=discrete,
+                    count=count,
+                    step=step,
+                    reference=reference,
+                    factor_stat=factor_stat,
+                    method=method,
+                    outcome=outcome,
+                    vce="delta",
+                )
+        else:
+            _margin_factory = None
+
         return self._delta(
             statistic, labels=labels, stat_name=stat_name, jac=jac_fn,
             outcome=outcome,
+            vce=vce,
+            cov_type=cov_type,
+            vcov=vcov,
+            cov_kwds=cov_kwds,
+            n_sims=n_sims,
+            sim_seed=sim_seed,
+            n_boot=n_boot,
+            boot_seed=boot_seed,
+            boot_method=boot_method,
+            cluster=cluster,
+            block_size=block_size,
+            verbose=verbose,
+            n_jobs=n_jobs,
+            ci_method=ci_method,
+            ci_alpha=ci_alpha,
+            _margin_factory=_margin_factory,
         )
 
     # ----- continuous case (numerical derivative) ---------------------------
@@ -1871,6 +2109,12 @@ class Margins:
         at: str = "overall",
         atexog: Optional[Mapping[str, object]] = None,
         factor_stat: Optional[str] = None,
+        vce: str = "delta",
+        cov_type: Optional[str] = None,
+        vcov: Optional[np.ndarray] = None,
+        cov_kwds: Optional[dict] = None,
+        ci_method: str = "pointwise",
+        ci_alpha: float = 0.05,
     ) -> "DiDResult":
         r"""Difference-in-differences on the response scale.
 
@@ -1890,6 +2134,18 @@ class Margins:
             Which two levels to use (reference first, treated second).
             Default: the two smallest observed levels.
         at, atexog, factor_stat : see :meth:`predict`.
+        vce : {"delta"}, default "delta"
+            Only delta-method VCE is supported for DiD in this release.
+        cov_type : str, optional
+            Recompute the parameter covariance using this covariance type.
+        vcov : ndarray, optional
+            User-supplied parameter covariance matrix.
+        cov_kwds : dict, optional
+            Additional keywords for covariance computation.
+        ci_method : {"pointwise", "bonferroni", "sidak", "sup-t"}, default "pointwise"
+            Confidence interval method.
+        ci_alpha : float, default 0.05
+            Significance level for confidence intervals.
 
         Returns
         -------
@@ -1973,6 +2229,10 @@ class Margins:
         MarginsResult.contrast
         DiDResult
         """
+        if vce != "delta":
+            raise NotImplementedError(
+                "Only vce='delta' is supported for did() in this release"
+            )
         g = (list(group_levels) if group_levels is not None
              else self._default_two_levels(group))
         c = (list(condition_levels) if condition_levels is not None
@@ -1995,7 +2255,11 @@ class Margins:
         # with condition varying fastest: (g0,c0),(g0,c1),(g1,c0),(g1,c1)
         atexog_full[group] = g
         atexog_full[condition] = c
-        cells = self.predict(at=at, atexog=atexog_full, factor_stat=factor_stat)
+        cells = self.predict(
+            at=at, atexog=atexog_full, factor_stat=factor_stat,
+            vce=vce, cov_type=cov_type, vcov=vcov, cov_kwds=cov_kwds,
+            ci_method=ci_method, ci_alpha=ci_alpha,
+        )
 
         K = self.n_outcomes
         outcome_names = (
@@ -2052,15 +2316,17 @@ class Margins:
             name="estimate",
         )
 
+        level = 1 - ci_alpha
         # Build joint result with outcome metadata for multi-outcome models
         joint_outcome_index = (np.tile(np.arange(K), 3) if K > 1 else None)
         joint = MarginsResult(
             estimate=all_contrasts.estimate,
             vcov=all_contrasts.vcov,
             labels=all_contrasts.labels,
-            level=self.level, df=self.df, stat_name="estimate",
+            level=level, df=self.df, stat_name="estimate",
             outcome_labels=self.outcome_labels if K > 1 else None,
             outcome_index=joint_outcome_index,
+            ci_method=ci_method,
         )
 
         # Slice back apart so users can grab each piece
@@ -2068,17 +2334,19 @@ class Margins:
             estimate=joint.estimate[:2 * K],
             vcov=joint.vcov[:2 * K, :2 * K],
             labels=joint.labels[:2 * K],
-            level=self.level, df=self.df, stat_name="simple effect",
+            level=level, df=self.df, stat_name="simple effect",
             outcome_labels=self.outcome_labels if K > 1 else None,
             outcome_index=(np.tile(np.arange(K), 2) if K > 1 else None),
+            ci_method=ci_method,
         )
         did_ = MarginsResult(
             estimate=joint.estimate[2 * K:3 * K],
             vcov=joint.vcov[2 * K:3 * K, 2 * K:3 * K],
             labels=joint.labels[2 * K:3 * K],
-            level=self.level, df=self.df, stat_name="DiD",
+            level=level, df=self.df, stat_name="DiD",
             outcome_labels=self.outcome_labels if K > 1 else None,
             outcome_index=(np.arange(K) if K > 1 else None),
+            ci_method=ci_method,
         )
         return DiDResult(cells=cells, simple_effects=simple, did=did_,
                          joint=joint)

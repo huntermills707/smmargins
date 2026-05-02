@@ -219,6 +219,32 @@ The test suite checks the module against:
   $\mathrm{ey/ex}(x_1)=\beta_1\,\overline{x_1}$ for the canonical-link
   case. Elasticities on a discrete variable raise.
 
+### External parity vs R `marginaleffects`
+
+`smmargins` is also pinned to the de-facto cross-language reference,
+[`marginaleffects`](https://marginaleffects.com), via a small set of
+checked-in R reference outputs. The R script is `tests/comparison/generate_r.R`
+(requires `marginaleffects`, `readr`, and `sandwich`) and the matching
+pytest assertions live in `tests/comparison/test_r.py`. Six cases are
+covered:
+
+| Case                                       | Estimate tol | SE tol           |
+| ------------------------------------------ | ------------ | ---------------- |
+| Logit AME with HC3                         | 1e-6         | 5e-5             |
+| Poisson AME with HC3                       | 1e-6         | 5e-4             |
+| OLS pairs bootstrap (n_boot=1000)          | 1e-10        | Monte-Carlo (5σ) |
+| OLS with HC1, polynomial + interaction     | 1e-6         | 1e-6             |
+| Logit cluster-robust AME                   | 1e-5         | 1e-4             |
+| Logit AME at representative `x2` values    | 1e-5         | 1e-4             |
+
+These tests are auto-skipped if the CSV reference files are missing, so
+the rest of the suite still runs without a working R install. Regenerate
+the references with:
+
+```bash
+cd tests/comparison && Rscript generate_r.R
+```
+
 ## Multi-outcome models
 
 `smmargins` supports `statsmodels.MNLogit` (multinomial logit) and
@@ -269,6 +295,85 @@ log-difference threshold deltas is left to a future release. Elasticity
 methods (`method="eyex" | "dyex" | "eydx"`) work on multi-outcome models
 and emit a `RuntimeWarning` when any predicted class probability falls
 below `1e-12` (where elasticities are numerically unstable).
+
+## Inference options (0.3)
+
+`smmargins` ships four tightly-related inference features behind one unified
+`vce=` API:
+
+### 1. Custom covariance (`cov_type=`, `vcov=`)
+
+Override the default covariance matrix used for delta-method SEs:
+
+```python
+# Recompute with robust HC3
+M = Margins(fit, cov_type="HC3")
+M.dydx("x1")
+
+# Cluster-robust (pass groups via cov_kwds)
+M = Margins(fit, cov_type="cluster", cov_kwds={"groups": df["cluster_id"]})
+M.dydx("x1")
+
+# User-supplied matrix (mutually exclusive with cov_type)
+M = Margins(fit, vcov=my_vcov_matrix)
+```
+
+Supported `cov_type` values include `"nonrobust"`, `"HC0"`–`"HC3"`,
+`"cluster"`, and `"HAC"`. When neither is passed, the covariance falls
+back to `results.cov_params()` (unchanged pre-0.3 behaviour).
+
+### 2. Krinsky–Robb simulation (`vce="simulation"`)
+
+Draw parameters from their sampling distribution and evaluate the margin
+function for each draw. Fast — no model refits.
+
+```python
+M.dydx("x1", vce="simulation", n_sims=2000, sim_seed=42)
+M.predict(atexog={"age": [25, 45, 65]}, vce="simulation", n_sims=5000)
+```
+
+The reported point estimate stays the analytic `g(β̂)`; draws are used
+only for SEs and percentile CIs. Composes with `cov_type=` naturally
+(e.g. `vce="simulation", cov_type="HC1"`).
+
+### 3. Bootstrap (`vce="bootstrap"`)
+
+Refit the model on each bootstrap sample. Supports pairs, cluster, and
+moving-block resampling:
+
+```python
+# Pairs bootstrap (default)
+M.dydx("x1", vce="bootstrap", n_boot=1000, boot_seed=42)
+
+# Cluster bootstrap
+M.dydx("x1", vce="bootstrap", boot_method="cluster",
+       cluster=df["firm_id"], n_boot=1000)
+
+# Block bootstrap (time series)
+M.dydx("x1", vce="bootstrap", boot_method="block",
+       block_size=10, n_boot=1000)
+```
+
+Optional `verbose=True` shows a progress bar; `n_jobs` enables parallel
+refits via `joblib`.
+
+### 4. Simultaneous confidence intervals (`ci_method=`)
+
+Four methods work with any VCE:
+
+```python
+M.dydx(["x1", "x2", "x3"], ci_method="bonferroni")
+M.dydx(["x1", "x2", "x3"], ci_method="sidak")
+M.predict(atexog={"x1": [-1, 0, 1]}, vce="simulation",
+          n_sims=2000, ci_method="sup-t")
+```
+
+- `"pointwise"` (default) — standard marginal CIs.
+- `"bonferroni"` — conservative family-wise adjustment.
+- `"sidak"` — slightly narrower than Bonferroni under independence.
+- `"sup-t"` — simulation-based simultaneous critical value from the
+  maximum standardized absolute deviation across the margin family.
+  Requires `vce="simulation"` or `"bootstrap"`.
 
 ## Difference-in-differences
 
@@ -323,8 +428,14 @@ See [CHANGELOG.md](CHANGELOG.md).
 - `smmargins/`        — the package directory.
   - `core.py`         — the main `Margins` class.
   - `data.py`         — data profiling and `patsy` integration.
-  - `results.py`      - `MarginsResult` and `DiDResult` containers.
-  - `utils.py`        — math helpers and Jacobian primitives.
+  - `inference.py`    — KR simulation and bootstrap VCE workers.
+  - `results.py`      — `MarginsResult` and `DiDResult` containers.
+  - `utils.py`        — math helpers, Jacobian primitives, and
+    `_get_param_cov` cov-matrix resolver.
 - `tests/`            — test suite (split by functionality).
-- `demo_margins.py`    — Williams-style walkthrough on a simulated dataset.
+  - `tests/comparison/` — R `marginaleffects` reference parity tests
+    (`generate_r.R` + `test_r.py`).
+- `demo_margins.py`    — Williams-style walkthrough on a simulated
+  dataset, including robust SEs, KR simulation, bootstrap, and
+  simultaneous-CI examples.
 - `demo_did.py`        — healthcare-style 2×2 DiD walkthrough.
