@@ -37,7 +37,15 @@ StatsModels ships ``Results.get_margeff``, but it is limited:
   response scale, with the joint covariance baked in;
 - :meth:`~smmargins.MarginsResult.contrast` — exact linear combinations
   of any result, reusing the joint covariance;
-- **Multi-outcome support** for ``MNLogit`` and ``OrderedModel``.
+- **Multi-outcome support** for ``MNLogit`` and ``OrderedModel``;
+- **Robust covariance passthrough** via ``cov_type=`` (``HC0``–``HC3``,
+  ``cluster``, ``HAC``) and ``vcov=`` (user-supplied matrix) on every
+  call;
+- **Krinsky–Robb simulation** (``vce="simulation"``) and **bootstrap**
+  (``vce="bootstrap"``, with pairs / cluster / moving-block resampling)
+  alternatives to the delta method;
+- **Simultaneous confidence intervals** for a family of margins via
+  ``ci_method="bonferroni" | "sidak" | "sup-t"``.
 
 Multi-outcome models
 --------------------
@@ -56,6 +64,66 @@ both rows and classes.
     # Subset to specific outcomes
     M.predict(outcome=1)               # only class 1
     M.predict(outcome="versicolor")    # by label, if labeled
+
+Inference options
+-----------------
+
+Every call to :meth:`~smmargins.Margins.predict`,
+:meth:`~smmargins.Margins.dydx`, and :meth:`~smmargins.Margins.did`
+accepts the same block of inference kwargs.
+
+**Robust covariance.** Pass ``cov_type=`` and (where relevant)
+``cov_kwds=`` to recompute the parameter covariance under a sandwich
+estimator before delta-method propagation. Pass ``vcov=`` to inject
+your own :math:`(k, k)` matrix instead. The two are mutually
+exclusive; if neither is set, ``results.cov_params()`` is used as-is
+(so a robust ``cov_type`` baked into the original ``fit`` is
+preserved).
+
+.. code-block:: python
+
+    M = Margins(fit, cov_type="HC3")
+    M.dydx("x1", cov_type="cluster",
+           cov_kwds={"groups": df["firm_id"]})
+    M.predict(at="mean", vcov=my_custom_matrix)
+
+**Krinsky–Robb simulation** (``vce="simulation"``). Draws
+:math:`\beta_s \sim N(\hat\beta, \hat V)` and evaluates the margin
+function for each draw. The reported point estimate stays the
+analytic :math:`g(\hat\beta)`; draws contribute only to standard
+errors and percentile intervals. Composes with ``cov_type=``.
+
+.. code-block:: python
+
+    M.dydx("x1", vce="simulation", n_sims=2000, sim_seed=42)
+    M.dydx("x1", vce="simulation", cov_type="HC1")
+
+**Bootstrap** (``vce="bootstrap"``). Refits the model on each
+bootstrap sample. Pairs is the default; ``boot_method="cluster"``
+takes a ``cluster=`` ID array, and ``boot_method="block"`` does a
+moving-block resample with ``block_size=``. Optional ``verbose=True``
+shows a progress bar; ``n_jobs`` parallelises refits via ``joblib``.
+
+.. code-block:: python
+
+    M.dydx("x1", vce="bootstrap", n_boot=1000, boot_seed=42)
+    M.dydx("x1", vce="bootstrap", boot_method="cluster",
+           cluster=df["firm_id"], n_boot=1000)
+
+**Simultaneous confidence intervals** (``ci_method=``). Bonferroni
+and Šidák are pure critical-value adjustments and work with any VCE.
+``"sup-t"`` consumes the simulation/bootstrap draw matrix to compute
+the simultaneous critical value as the upper-tail quantile of the
+maximum standardised absolute deviation across the family — typically
+narrower than Bonferroni when the margins in the family are
+correlated.
+
+.. code-block:: python
+
+    M.dydx(["x1", "x2", "x3"], ci_method="bonferroni")
+    M.predict(atexog={"age": [25, 45, 65]},
+              vce="simulation", n_sims=4000,
+              ci_method="sup-t")
 
 Difference-in-differences
 -------------------------
@@ -111,6 +179,18 @@ Quickstart
     res = M.did("group", "preexist_Y",
                 group_levels=["A", "B"], condition_levels=[0, 1])
     print(res)                                     # cells, simple effects, DiD
+
+    # Alternative VCEs and robust covariance
+    M.dydx("age", cov_type="HC3")                  # heteroskedastic-robust
+    M.dydx("age", vce="simulation", n_sims=2000,
+           sim_seed=0)                              # Krinsky–Robb
+    M.dydx("age", vce="bootstrap", n_boot=1000,
+           boot_seed=0)                             # pairs bootstrap
+
+    # Simultaneous CIs across a family of three predictions
+    M.predict(atexog={"age": [25, 45, 65]},
+              vce="simulation", n_sims=4000,
+              ci_method="sup-t")
 
 Each call returns a :class:`~smmargins.MarginsResult` with ``.estimate``,
 ``.se``, ``.vcov``, ``.ci_lower``, ``.ci_upper``, ``.pvalue``, plus

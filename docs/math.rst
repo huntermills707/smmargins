@@ -182,6 +182,81 @@ optimum scales as :math:`h \sim \epsilon^{1/3}`. See
   from the FD answer that the other tests pin to Stata /
   `get_margeff`.
 
+Beyond delta: simulation and bootstrap VCEs
+-------------------------------------------
+
+The delta method is a first-order approximation: :math:`G\widehat V
+G^\top` is exact only to the extent that :math:`g` is locally linear
+in :math:`\beta` near :math:`\hat\beta`. For statistics that are
+sharply nonlinear (a probability near 0 or 1, an elasticity at a
+near-zero prediction) this can produce symmetric Wald intervals that
+extend beyond the natural support, or under-cover when the curvature
+is non-negligible.
+
+``smmargins`` exposes two alternatives behind the same ``vce=``
+keyword.
+
+**Krinsky–Robb simulation** (``vce="simulation"``). Draw
+:math:`S` parameter vectors :math:`\beta_s\sim N(\hat\beta,\widehat
+V)`, evaluate :math:`g(\beta_s)` for each, and read inference off
+the empirical distribution of the draws:
+
+.. math::
+
+    \widehat{\operatorname{Var}}_{\mathrm{KR}}\bigl[g(\hat\beta)\bigr]
+    = \frac{1}{S-1}\sum_{s=1}^S
+        \bigl(g(\beta_s) - \bar g\bigr)\!\bigl(g(\beta_s) - \bar g\bigr)^{\!\top}.
+
+The reported point estimate stays the *analytic* :math:`g(\hat\beta)`,
+not :math:`\bar g`; this matches Stata's ``vce(simulation)``
+convention and avoids spurious bias from finite :math:`S`. Pointwise
+intervals default to empirical quantiles of the draws and so are not
+forced to be symmetric — an asymmetric CI for an extreme probability
+is the practical reason to reach for KR.
+
+**Bootstrap** (``vce="bootstrap"``). Refit the model on
+:math:`B` resamples of the rows and read inference off the bootstrap
+distribution. Three resampling schemes are built in (``boot_method=``):
+
+- ``"pairs"`` — :math:`(y_i, x_i)` resampled IID (default);
+- ``"cluster"`` — whole clusters resampled with replacement,
+  required for robustness to within-cluster correlation;
+- ``"block"`` — moving-block resampling for time series, with
+  ``block_size=`` chosen to span the dependence horizon.
+
+Failed refits are caught and counted; a ``RuntimeWarning`` fires when
+the failure rate exceeds 5%. The point estimate is again the analytic
+:math:`g(\hat\beta)`, not the bootstrap mean.
+
+Simultaneous confidence intervals
+---------------------------------
+
+For a family of :math:`m` margins returned in a single call,
+``ci_method=`` controls the critical value. With pointwise critical
+value :math:`z_{1-\alpha/2}`:
+
+- ``"bonferroni"`` uses :math:`z_{1-\alpha/(2m)}` — works with any
+  VCE;
+- ``"sidak"`` uses
+  :math:`z_{(1+(1-\alpha)^{1/m})/2}`, slightly narrower than
+  Bonferroni — also works with any VCE;
+- ``"sup-t"`` uses the :math:`(1-\alpha)` quantile of the maximum
+  standardised absolute deviation across the family, computed from
+  the simulation/bootstrap draw matrix:
+
+  .. math::
+
+      c_{\sup\text{-}t}^{\,(1-\alpha)}
+      = Q_{1-\alpha}\!\left(
+          \max_{j=1,\dots,m}
+          \left|\frac{g_j(\beta_s) - g_j(\hat\beta)}{\widehat\sigma_j}\right|
+        \right).
+
+Sup-t requires draws (so ``vce`` must be ``"simulation"`` or
+``"bootstrap"``) and is typically narrower than Bonferroni / Šidák
+when the margins in the family are correlated — exactly the case for
+margins evaluated at neighbouring covariate profiles.
+
 Why the response scale matters for DiD (Ai & Norton 2003)
 ---------------------------------------------------------
 
