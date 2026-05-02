@@ -6,16 +6,23 @@ Walkthrough of the core analyses in Richard Williams' *Margins01* notes
 (https://academicweb.nd.edu/~rwilliam/stats/Margins01.pdf), implemented
 on top of StatsModels + patsy + the ``smmargins`` package.
 
-We'll reproduce, in turn:
-
-  1. Adjusted predictions at specific values (APR / "margins, at(...)")
-  2. Adjusted predictions at means (APM / "margins, atmeans")
-  3. Average adjusted predictions (AAP / "margins")
-  4. Marginal effects at representative values (MER / "margins, dydx(..) at(..)")
-  5. Marginal effects at means (MEM / "margins, dydx(..) atmeans")
-  6. Average marginal effects (AME / "margins, dydx(..)")
-  7. Discrete changes for categorical variables
-  8. The interaction example that Williams uses to motivate AME
+Sections
+--------
+  1.  Adjusted predictions at specific values (APR / ``margins, at(...)``)
+  2.  APM vs AAP (``margins, atmeans`` vs ``margins``)
+  3.  MER vs MEM vs AME for a continuous covariate
+  4.  Discrete contrast for a categorical variable
+  5.  Discrete change for a 0/1 dummy
+  6.  AME by interaction subgroup (Williams' motivating example)
+  7.  Predicted probability over age, by sex (table for plotting)
+  8.  Analytic vs FD parity check
+  9.  Robust covariance (``cov_type="HC3"``)
+  10. Krinsky–Robb simulation VCE
+  11. Pairs bootstrap VCE
+  12. Simultaneous CIs via sup-t
+  13. Cluster-robust SEs (``cov_type="cluster"``)
+  14. Multiple-comparison adjustments side-by-side (Bonferroni / Sidak / sup-t)
+  15. User-supplied parameter covariance (``vcov=``)
 """
 
 import numpy as np
@@ -171,3 +178,121 @@ print(f"AME(age) FD       : est={ame_fd.estimate[0]: .8f}  se={ame_fd.se[0]: .8f
 print(f"max abs diff      : "
       f"est {abs(ame_an.estimate[0] - ame_fd.estimate[0]): .2e}, "
       f"se {abs(ame_an.se[0] - ame_fd.se[0]): .2e}")
+
+# ---------------------------------------------------------------------------
+# 9. Robust covariance (Feature 1)
+#    Recompute SEs with HC3 heteroskedasticity-consistent covariance.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("9. Robust covariance — HC3")
+print("=" * 80)
+M_hc3 = Margins(fit, cov_type="HC3")
+print(M_hc3.dydx("age"))
+
+# ---------------------------------------------------------------------------
+# 10. Krinsky–Robb simulation VCE (Feature 2)
+#     Draw parameters from their sampling distribution and evaluate margins.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("10. Krinsky–Robb simulation VCE")
+print("=" * 80)
+print(M.dydx("age", vce="simulation", n_sims=2000, sim_seed=42))
+
+# ---------------------------------------------------------------------------
+# 11. Bootstrap VCE (Feature 3)
+#     Pairs bootstrap with 500 replications.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("11. Bootstrap VCE")
+print("=" * 80)
+print(M.dydx("age", vce="bootstrap", n_boot=500, boot_seed=42))
+
+# ---------------------------------------------------------------------------
+# 12. Simultaneous CIs — sup-t (Feature 4)
+#     Use simulation draws to compute simultaneous CIs for a family of margins.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("12. Simultaneous CIs (sup-t)")
+print("=" * 80)
+print(M.predict(atexog={"age": [25, 45, 65]},
+                vce="simulation", n_sims=2000, sim_seed=42,
+                ci_method="sup-t"))
+
+# ---------------------------------------------------------------------------
+# 13. Cluster-robust SEs
+#     Synthesize a clustering structure (e.g., households of ~10 voters who
+#     share unobserved local effects). Cluster-robust SEs propagate that
+#     correlation through the Jacobian to the AME.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("13. Cluster-robust SEs vs nonrobust  (synthetic household clusters)")
+print("=" * 80)
+df_c = df.copy()
+df_c["household"] = rng.integers(0, N // 10, N)  # ~10 obs per cluster
+fit_c = smf.logit(
+    "voted ~ age + income + C(educ) + female + age:female",
+    data=df_c,
+).fit(disp=False)
+M_nonrobust = Margins(fit_c)
+M_cluster = Margins(fit_c, cov_type="cluster",
+                    cov_kwds={"groups": df_c["household"]})
+ame_nr = M_nonrobust.dydx("age").se[0]
+ame_cl = M_cluster.dydx("age").se[0]
+print(f"AME(age) SE — nonrobust : {ame_nr: .6f}")
+print(f"AME(age) SE — cluster    : {ame_cl: .6f}   (ratio {ame_cl / ame_nr:.2f}x)")
+
+# ---------------------------------------------------------------------------
+# 14. Multiple-comparison adjustments
+#     A family of 5 marginal effects at different ages. Pointwise CIs
+#     under-cover the joint event "all 5 contain the truth"; Bonferroni
+#     and Sidak inflate the critical value uniformly; sup-t uses the
+#     simulation draws to exploit correlation across the family.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("14. Family-wise CI methods at age=25,35,45,55,65")
+print("=" * 80)
+ages = [25, 35, 45, 55, 65]
+common = dict(atexog={"age": ages}, vce="simulation",
+              n_sims=4000, sim_seed=123)
+pw   = M.predict(**common, ci_method="pointwise")
+bonf = M.predict(**common, ci_method="bonferroni")
+sidk = M.predict(**common, ci_method="sidak")
+supt = M.predict(**common, ci_method="sup-t")
+
+widths = pd.DataFrame({
+    "age":        ages,
+    "pointwise":  pw.ci_upper   - pw.ci_lower,
+    "bonferroni": bonf.ci_upper - bonf.ci_lower,
+    "sidak":      sidk.ci_upper - sidk.ci_lower,
+    "sup-t":      supt.ci_upper - supt.ci_lower,
+}).set_index("age")
+print("CI widths:")
+print(widths)
+print("\nBonferroni >= Sidak (always); for correlated margins sup-t is "
+      "typically narrower than both.")
+
+# ---------------------------------------------------------------------------
+# 15. User-supplied vcov
+#     Drop in any (k, k) covariance matrix you trust — e.g. a sandwich
+#     computed offline, a Bayesian posterior covariance, or the output
+#     of a custom resampling scheme — and smmargins will sandwich it
+#     through the Jacobian without recomputing anything else.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("15. User-supplied parameter covariance (vcov=)")
+print("=" * 80)
+V_default = fit.cov_params().to_numpy()
+V_inflated = V_default * 1.5     # toy example: assume 50% wider sampling cov
+M_v = Margins(fit, vcov=V_inflated)
+ame_default = M.dydx("age").se[0]
+ame_user    = M_v.dydx("age").se[0]
+print(f"AME(age) SE — default cov_params() : {ame_default: .6f}")
+print(f"AME(age) SE — vcov = 1.5 x default : {ame_user: .6f}   "
+      f"(ratio {ame_user / ame_default:.3f}, expect ≈ sqrt(1.5)={np.sqrt(1.5):.3f})")

@@ -7,7 +7,7 @@ packages = ["smmargins"]
 
 [project]
 name = "smmargins"
-version = "0.2.0"
+version = "0.3.0"
 description = "Marginal effects for StatsModels"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -19,6 +19,9 @@ classifiers = [
   "License :: OSI Approved :: BSD License",
   "Operating System :: OS Independent",
 ]
+
+[project.optional-dependencies]
+parallel = ["joblib"]
 
 [project.urls]
 Homepage = "https://github.com/huntermills707/smmargins"
