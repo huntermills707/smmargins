@@ -27,11 +27,16 @@ Rscript generate_r.R
 
 Produces:
 - `r_logit_ame_hc3.csv` — Logit AME with HC3
-- `r_poisson_irr.csv` — Poisson IRR-scale margin
+- `r_poisson_ame.csv` — Poisson AME with HC3
 - `r_ols_bootstrap.csv` — OLS bootstrap AME
 - `r_ols_hc1.csv` — OLS with HC1 (polynomial + interaction)
 - `r_logit_cluster.csv` — Logit cluster-robust AME
 - `r_logit_at.csv` — Logit AME at representative values of `x2`
+- `r_linear.csv` — Logit linear-scale AME (0.4 `scale="linear"`)
+- `r_over.csv` — Logit subgroup AMEs by `grp` (0.4 `over=`)
+- `r_weighted.csv` — Logit weighted AME (0.4 `weights=`)
+- `r_coef.csv` — Coefficient table for Wald parity (0.4 `wald()`)
+- `r_comparisons.csv` — Level-vs-reference comparisons (0.4 `pairwise()`)
 
 ## Maintenance
 

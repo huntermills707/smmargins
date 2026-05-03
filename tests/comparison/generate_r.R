@@ -68,3 +68,31 @@ d_long <- data.frame(
 )
 mfx_logit_at <- avg_slopes(fit_logit_at, variables = "x1", newdata = d_long, by = "x2")
 write_csv(mfx_logit_at, "r_logit_at.csv")
+
+# 0.4 fixtures ===============================================================
+# Reuse fit_logit (Logit AME, df_a) from section 1.
+
+# 7. Linear-scale (xb) AME on Logit ------------------------------------------
+mfx_linear <- avg_slopes(fit_logit, vcov = "HC3", type = "link")
+write_csv(mfx_linear, "r_linear.csv")
+
+# 8. Subgroup AMEs (over=grp) ------------------------------------------------
+mfx_over <- avg_slopes(fit_logit, vcov = "HC3", by = "grp")
+write_csv(mfx_over, "r_over.csv")
+
+# 9. Weighted AMEs (pweights) ------------------------------------------------
+df_a$w <- runif(nrow(df_a), 0.5, 2.0)
+fit_logit_w <- glm(y_logit ~ x1 + x2 + grp, data = df_a, family = binomial, weights = df_a$w)
+mfx_weighted <- avg_slopes(fit_logit_w, vcov = "HC3")
+write_csv(mfx_weighted, "r_weighted.csv")
+
+# 10. Coefficient table for Wald parity --------------------------------------
+coef_table <- as.data.frame(summary(fit_logit)$coefficients)
+coef_table$term <- rownames(coef_table)
+write_csv(coef_table, "r_coef.csv")
+
+# 11. Pairwise comparisons (level vs reference) ------------------------------
+# marginaleffects 0.32 doesn't support hypothesis="pairwise" directly; we
+# compute level-vs-reference comparisons and let Python build pairwise.
+comp_grp <- comparisons(fit_logit, variables = list(grp = "all"))
+write_csv(comp_grp, "r_comparisons.csv")

@@ -107,6 +107,13 @@ M.dydx("x1", method="eydx")                       # semi-elasticity:    ey/dx = 
 # Combine with at=/atexog= as usual; raises on discrete variables.
 # On multi-outcome models returns one elasticity per outcome class.
 
+# --- 0.4: scales, weights, subgroups, joint tests ---
+M.dydx("x1", scale="linear")                      # AME on Xβ (Stata's xb)
+M.dydx("x1", over="region")                       # subgroup AMEs (joint vcov preserved)
+Margins(fit, weights=w).dydx("x1")                # observation weights (sampling/frequency)
+res = M.dydx(["x1", "x2"]); res.wald()            # joint Wald test of margins == 0
+res = M.dydx("group"); res.pairwise(by="group")   # all level-vs-level comparisons
+
 # --- factor handling at evaluation points ---
 M.predict(at="mean")                              # factor dummies at observed proportions (Stata default)
 M.predict(at="mean", factor_stat="mode")          # factors held at modal level
@@ -375,6 +382,102 @@ M.predict(atexog={"x1": [-1, 0, 1]}, vce="simulation",
   maximum standardized absolute deviation across the margin family.
   Requires `vce="simulation"` or `"bootstrap"`.
 
+## Scales, weights, subgroups, joint tests (0.4)
+
+Six features layered on top of the 0.3 inference machinery. Each
+composes with `vce=`, `cov_type=`, and `ci_method=`.
+
+### 1. Prediction scale (`scale=`)
+
+Choose what `predict()` and `dydx()` operate on. Default is response
+scale (`Λ(η)` for logit, `exp(η)` for Poisson, etc.).
+
+```python
+M.predict(scale="linear")              # linear predictor η = Xβ (Stata's xb)
+M.dydx("x1", scale="or")               # AME on the odds-ratio scale (logit only)
+M.dydx("x1", scale="exp")              # AME of exp(η) — generic across families
+```
+
+Built-in values: `"response"` (default), `"linear"`, `"pr"`, `"ir"`,
+`"or"`, `"exp"`, `"log"`. Invalid combinations error clearly
+(e.g. `scale="or"` on Poisson). Stata users: `predict(xb)` ↔
+`scale="linear"`.
+
+### 2. Custom transforms (`Transform`)
+
+Pass a `Transform` instance to `scale=` for a user-defined λ. `dydx`
+requires an analytic second derivative (`hess=`); `predict` only
+needs `grad=`. **No autodiff** — analytic derivatives are a deliberate
+package contract.
+
+```python
+from smmargins import Transform
+import numpy as np
+
+square = Transform(value=lambda e: e**2,
+                   grad=lambda e: 2*e,
+                   hess=lambda e: np.full_like(e, 2.0),
+                   name="square")
+
+M.dydx("x1", scale=square)
+```
+
+Built-ins (`Identity`, `Linear`, `Exp`, `Log`, `Logit`, `Probit`) are
+exported from `smmargins.transforms`.
+
+### 3. Elasticities × scales
+
+Every elasticity method composes with every scale. No new methods —
+just routing.
+
+```python
+M.dydx("x1", method="eyex", scale="linear")    # ey/ex on the linear predictor
+M.dydx("x1", method="eyex", scale=square)      # ey/ex through a custom transform
+```
+
+### 4. Observation weights (`weights=`)
+
+Pass weights at construction. `weight_type="sampling"` (default) or
+`"frequency"`. WLS-fitted results respect their fit-time weights when
+`weights=None`; explicit `weights=` overrides and warns.
+
+```python
+M = Margins(fit, weights=w)                                 # sampling
+M = Margins(fit, weights=counts, weight_type="frequency")   # replication
+M.dydx("x1", vce="bootstrap", n_boot=1000)                  # weighted resampling
+```
+
+### 5. Subgroup AMEs (`over=`)
+
+Partition the sample by one or more columns and average within each
+subgroup. The full joint covariance is preserved (not block-diagonal),
+so cross-subgroup contrasts and Wald tests stay valid.
+
+```python
+M.dydx("x1", over="region")
+M.dydx("x1", over=["region", "sex"])
+M.predict(over="region")
+```
+
+### 6. Joint tests and pairwise comparisons (`wald()`, `pairwise()`)
+
+```python
+res = M.dydx(["x1", "x2", "x3"])
+res.wald()                          # joint test that all margins == 0
+res.wald(C=[[1, -1, 0]])            # H0: AME(x1) == AME(x2)
+res.wald(C=np.eye(3)[:2], value=0)  # custom restriction
+
+res = M.dydx("group")                          # discrete contrasts vs reference
+pw = res.pairwise(by="group")                  # all level-vs-level pairs
+pw_bonf = res.pairwise(by="group", ci_method="bonferroni")
+```
+
+`wald()` returns a `WaldResult(stat, df, pvalue, contrast_matrix,
+contrast_estimates)`. `pairwise()` returns a `MarginsResult` whose
+`ci_method=` passes through the simultaneous-CI machinery (`sup-t`
+under `vce="simulation"` is narrower than Bonferroni when contrasts
+are correlated).
+
 ## Difference-in-differences
 
 Two small additions turn the module into a full DiD estimator:
@@ -426,12 +529,15 @@ See [CHANGELOG.md](CHANGELOG.md).
 ## Files
 
 - `smmargins/`        — the package directory.
-  - `core.py`         — the main `Margins` class.
+  - `core.py`         — the `Margins` orchestrator (predict/dydx/did).
+  - `_design.py`      — `DesignResolver`: frame, design info, `at=`/`over=` expansion.
+  - `_engine.py`      — `PredictionEngine`: predictions, gradients, scale dispatch, weights.
+  - `_derivs.py`      — `DerivativeEngine`: continuous/count/discrete dydx component builders.
   - `data.py`         — data profiling and `patsy` integration.
+  - `transforms.py`   — `Transform` class and built-in scales (0.4).
   - `inference.py`    — KR simulation and bootstrap VCE workers.
-  - `results.py`      — `MarginsResult` and `DiDResult` containers.
-  - `utils.py`        — math helpers, Jacobian primitives, and
-    `_get_param_cov` cov-matrix resolver.
+  - `results.py`      — `MarginsResult`, `DiDResult`, `WaldResult` containers.
+  - `utils.py`        — math helpers, Jacobian primitives, validators.
 - `tests/`            — test suite (split by functionality).
   - `tests/comparison/` — R `marginaleffects` reference parity tests
     (`generate_r.R` + `test_r.py`).

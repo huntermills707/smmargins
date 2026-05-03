@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .core import Margins
+    from ._design import DesignResolver
 
 @dataclass
 class _Profile:
@@ -34,15 +34,15 @@ class _Profile:
     collapse_design: bool = False
     collapse_numerics: bool = False
 
-    def prepare_frame(self, frame: pd.DataFrame, margins: Margins) -> pd.DataFrame:
+    def prepare_frame(self, frame: pd.DataFrame, design: "DesignResolver") -> pd.DataFrame:
         """Apply numerics-collapse to a frame when configured.
 
         Parameters
         ----------
         frame : pd.DataFrame
             Data-space frame to prepare.
-        margins : Margins
-            Margins instance providing ``_collapse_numerics_to_mean``.
+        design : DesignResolver
+            DesignResolver providing ``collapse_numerics_to_mean``.
 
         Returns
         -------
@@ -50,27 +50,27 @@ class _Profile:
             The prepared frame (collapsed or unchanged).
         """
         if self.collapse_numerics:
-            return margins._collapse_numerics_to_mean(frame)
+            return design.collapse_numerics_to_mean(frame)
         return frame
 
-    def materialize(self, frame: pd.DataFrame, margins: Margins) -> np.ndarray:
+    def materialize(self, frame: pd.DataFrame, design: "DesignResolver") -> np.ndarray:
         """Run the full pipeline (numerics collapse → build → design collapse).
 
         Parameters
         ----------
         frame : pd.DataFrame
             Data-space frame to materialize.
-        margins : Margins
-            Margins instance providing ``_build_exog`` and
-            ``_collapse_numerics_to_mean``.
+        design : DesignResolver
+            DesignResolver providing ``build_exog`` and
+            ``collapse_numerics_to_mean``.
 
         Returns
         -------
         ndarray
             Final design matrix ready for prediction.
         """
-        frame = self.prepare_frame(frame, margins)
-        X = margins._build_exog(frame)
+        frame = self.prepare_frame(frame, design)
+        X = design.build_exog(frame)
         if self.collapse_design:
             X = X.mean(axis=0, keepdims=True)
         return X

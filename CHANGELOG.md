@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-02
+
+### Added
+
+- **`scale=` for transformed predictions and marginal effects**. Built-in
+  scales: `"response"` (default), `"linear"` (η = Xβ), `"pr"` (probability),
+  `"ir"` (incidence rate), `"or"` (odds ratio), `"exp"` (exp(η)), `"log"`
+  (log of response). A custom `Transform(value, grad, hess, name)` object is
+  also accepted. The analytic Jacobian for continuous `dydx` now uses
+  `Transform.hess` directly when available, with an FD fallback controlled by
+  the module-level `_DYDX_FD_ONLY` flag for testing.
+- **`Transform` strict analytic contract**. Custom transforms must supply
+  `grad`; `dydx` additionally requires `hess`. Missing `hess` raises a clear
+  `ValueError` on `dydx` but is allowed on `predict`.
+- **Elasticities compose with `scale=`**. `eyex`, `dyex`, `eydx` methods work
+  with any built-in or custom scale. Hand-derived parity tests confirm the
+  chain rule is correct (Poisson canonical `eyex = β·x̄` to 1e-10).
+- **Observation weights** (`weights=`, `weight_type=`). Sampling and frequency
+  weights flow through prediction, marginal effect, and inference paths.
+  Bootstrap resampling respects weights. WLS / GLM weights are inherited
+  automatically unless overridden.
+- **`over=` subgroup AMEs / predictions**. Partitions the data by one or more
+  columns, computes subgroup-specific statistics, and stacks Jacobians for a
+  full joint covariance (`J @ V @ J.T` with nonzero off-diagonal blocks).
+  Works with `at=`, `atexog=`, and `weights=`.
+- **Joint Wald testing and pairwise contrasts**. `MarginsResult.wald(C, value)`
+  returns a `WaldResult` with χ² statistic, df, and p-value.
+  `MarginsResult.pairwise(by, ci_method)` builds all level-vs-level contrasts
+  for a factor and returns a new `MarginsResult` with multiplicity adjustment
+  via the existing `ci_method=` machinery.
+- New test files covering every 0.4 feature:
+  - `tests/test_scales.py` — built-in scales, FD-vs-analytic Jacobian parity
+  - `tests/test_custom_transform.py` — `Transform` contract, quadratic hand check
+  - `tests/test_weights.py` — equal-weights parity, frequency weights, bootstrap,
+    WLS passthrough, multi-output weights
+  - `tests/test_wald.py` — single/joint Wald, linear combinations, pairwise,
+    Bonferroni adjustment, singular vcov error
+  - `tests/test_elasticities.py` — extended with scale×elasticity composition
+  - `tests/test_over.py` — subgroup predictions, AMEs, joint vcov, contrasts
+  - `tests/comparison/release_0_4.R` + `test_release_0_4_parity.py` — R
+    `marginaleffects` parity for linear scale, `over=`, and weighted AMEs
+
+### Changed
+
+- `MarginsResult.contrast()` and `.pairwise()` now accept an optional
+  `ci_method` parameter to override the source result's CI method.
+
 ## [0.3.0] - 2026-05-01
 
 ### Added

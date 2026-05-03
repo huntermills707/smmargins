@@ -46,6 +46,21 @@ StatsModels ships ``Results.get_margeff``, but it is limited:
   alternatives to the delta method;
 - **Simultaneous confidence intervals** for a family of margins via
   ``ci_method="bonferroni" | "sidak" | "sup-t"``.
+- **Prediction scales** (``scale=``) for ``predict()`` / ``dydx()``:
+  ``"response"`` (default), ``"linear"`` (Stata's ``xb``), ``"pr"``,
+  ``"ir"``, ``"or"``, ``"exp"``, ``"log"``, plus user-defined
+  :class:`~smmargins.Transform` instances with analytic
+  :math:`\lambda'` and :math:`\lambda''`.
+- **Observation weights** (``weights=``, ``weight_type=``) threaded
+  through AME averaging and bootstrap resampling.
+- **Subgroup AMEs** via ``over=``, with the full joint covariance
+  preserved across subgroups (not block-diagonal).
+- **Joint Wald tests and pairwise comparisons** via
+  :meth:`~smmargins.MarginsResult.wald` and
+  :meth:`~smmargins.MarginsResult.pairwise`, returning a
+  :class:`~smmargins.WaldResult` or a pairwise
+  :class:`~smmargins.MarginsResult` whose ``ci_method=`` composes
+  with the simultaneous-CI machinery.
 
 Multi-outcome models
 --------------------
@@ -124,6 +139,84 @@ correlated.
     M.predict(atexog={"age": [25, 45, 65]},
               vce="simulation", n_sims=4000,
               ci_method="sup-t")
+
+Scales, weights, subgroups, joint tests
+---------------------------------------
+
+Six features added in 0.4. Each composes with the inference options
+above (``vce=``, ``cov_type=``, ``ci_method=``).
+
+**Prediction scale (``scale=``).** Choose what ``predict()`` and
+``dydx()`` operate on. The default ``"response"`` keeps current
+behaviour; ``"linear"`` is the linear predictor :math:`\eta = X\beta`
+(Stata's ``predict(xb)``). Other built-ins: ``"pr"``, ``"ir"``,
+``"or"``, ``"exp"``, ``"log"``. Invalid combinations error clearly
+(``scale="or"`` on Poisson, ``scale="log"`` when any prediction is
+non-positive).
+
+.. code-block:: python
+
+    M.predict(scale="linear")
+    M.dydx("x1", scale="or")          # AME on the odds-ratio scale
+    M.dydx("x1", method="eyex", scale="linear")  # elasticities × scales compose
+
+**Custom transforms (``Transform``).** Pass a
+:class:`~smmargins.Transform` for a user-defined :math:`\lambda`.
+``dydx`` requires an analytic second derivative ``hess=``; ``predict``
+only needs ``grad=``. No autodiff — analytic derivatives are a
+deliberate package contract.
+
+.. code-block:: python
+
+    from smmargins import Transform
+    import numpy as np
+
+    square = Transform(value=lambda e: e**2,
+                       grad=lambda e: 2*e,
+                       hess=lambda e: np.full_like(e, 2.0),
+                       name="square")
+    M.dydx("x1", scale=square)
+
+Built-ins (``Identity``, ``Linear``, ``Exp``, ``Log``, ``Logit``,
+``Probit``) live in :mod:`smmargins.transforms`.
+
+**Observation weights (``weights=``).** Pass weights at construction.
+``weight_type="sampling"`` (default) or ``"frequency"``. WLS-fitted
+results respect their fit-time weights when ``weights=None``;
+explicit ``weights=`` overrides and warns. Bootstrap resampling uses
+weight-proportional draws under sampling weights.
+
+.. code-block:: python
+
+    M = Margins(fit, weights=w)
+    M = Margins(fit, weights=counts, weight_type="frequency")
+
+**Subgroup AMEs (``over=``).** Partition the sample by one or more
+columns and average within each subgroup. The full joint covariance
+is preserved (not block-diagonal), so cross-subgroup contrasts and
+Wald tests stay valid.
+
+.. code-block:: python
+
+    M.dydx("x1", over="region")
+    M.dydx("x1", over=["region", "sex"])
+
+**Joint tests and pairwise comparisons.**
+:meth:`~smmargins.MarginsResult.wald` returns a
+:class:`~smmargins.WaldResult`; :meth:`~smmargins.MarginsResult.pairwise`
+returns a pairwise :class:`~smmargins.MarginsResult` whose
+``ci_method=`` flows into the simultaneous-CI machinery.
+
+.. code-block:: python
+
+    res = M.dydx(["x1", "x2", "x3"])
+    res.wald()                       # joint test that all margins == 0
+    res.wald(C=[[1, -1, 0]])         # H0: AME(x1) == AME(x2)
+
+    res = M.dydx("group")
+    res.pairwise(by="group")                          # raw
+    res.pairwise(by="group", ci_method="bonferroni")  # adjusted
+    res.pairwise(by="group", ci_method="sup-t")       # needs vce='simulation'/'bootstrap'
 
 Difference-in-differences
 -------------------------

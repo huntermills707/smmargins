@@ -102,6 +102,39 @@ def _get_param_cov(results, cov_type=None, vcov=None, cov_kwds=None):
         "Try fitting the model with cov_type directly, or pass vcov manually."
     )
 
+def check_at(at: str) -> None:
+    """Validate ``at`` argument, raising if unknown."""
+    if at not in ("overall", "mean", "median", "zero"):
+        raise ValueError(
+            f"at must be 'overall', 'mean', 'median', or 'zero', "
+            f"got {at!r}"
+        )
+
+
+def check_factor_stat(factor_stat: str) -> None:
+    """Validate ``factor_stat`` argument, raising if unknown."""
+    if factor_stat not in ("mean", "mode", "zero"):
+        raise ValueError(
+            f"factor_stat must be 'mean', 'mode', or 'zero', "
+            f"got {factor_stat!r}"
+        )
+
+
+def default_factor_stat(at: str) -> str:
+    """Pick a sensible ``factor_stat`` when the user did not supply one.
+
+    Maps ``at`` values to their natural factor handling:
+    ``overall`` -> ``mean``, ``mean`` -> ``mean``, ``median`` -> ``mode``,
+    ``zero`` -> ``zero``.
+    """
+    return {
+        "overall": "mean",  # ignored — no collapse happens
+        "mean":    "mean",  # Stata default: design-matrix proportions
+        "median":  "mode",  # median is undefined for categoricals
+        "zero":    "zero",  # reference level — matches at='zero' semantics
+    }[at]
+
+
 def _central_jacobian(
     func: Callable[[np.ndarray], np.ndarray],
     x: np.ndarray,
@@ -175,6 +208,62 @@ def _central_jacobian(
         J[:, i] = (fp - fm) / (2.0 * hi)
 
     return J
+
+
+def softmax_grad_mean(X: np.ndarray, beta: np.ndarray, weights: Optional[np.ndarray] = None) -> np.ndarray:
+    r"""Analytic gradient of mean softmax probabilities for MNLogit.
+
+    For a K-class multinomial logit with class 0 as reference,
+    computes the gradient of
+    :math:`(1/n)\sum_i P(Y=c \mid x_i)` w.r.t. the flat parameter
+    vector for every class c.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n, p)
+        Design matrix.
+    beta : ndarray of shape (p*(K-1),)
+        Flat parameter vector in column-major (Fortran) order:
+        ``[beta_1, beta_2, ..., beta_{K-1}]`` where each ``beta_k``
+        has length ``p``.
+
+    Returns
+    -------
+    ndarray of shape (K, p*(K-1))
+        Gradient matrix. Row ``c`` is the gradient for outcome class ``c``.
+    """
+    X = np.asarray(X, dtype=float)
+    n, p = X.shape
+    # beta is flat vector of length p*(K-1)
+    # Reshape to (p, K-1) in Fortran order (class blocks contiguous)
+    K = beta.size // p + 1
+    B = beta.reshape(p, K - 1, order="F")
+    # Linear predictors for classes 1..K-1
+    eta = X @ B  # (n, K-1)
+    # Probabilities
+    exp_eta = np.exp(eta)
+    denom = 1 + exp_eta.sum(axis=1, keepdims=True)  # (n, 1)
+    P_alt = exp_eta / denom  # (n, K-1)
+    P_0 = 1 / denom  # (n, 1)
+    P = np.hstack([P_0, P_alt])  # (n, K)
+
+    # delta_{c,k} for c=0..K-1, k=1..K-1
+    delta = np.zeros((K, K - 1))
+    for k in range(1, K):
+        delta[k, k - 1] = 1.0
+
+    # weight[i, c, k] = P_{c,i} * (delta_{c,k} - P_{k,i})
+    diff = delta[None, :, :] - P[:, None, 1:]  # (n, K, K-1)
+    weight = P[:, :, None] * diff  # (n, K, K-1)
+
+    # grad_{c,k} = (1/n) sum_i weight[i,c,k] * x_i
+    w = np.asarray(weights, dtype=float) if weights is not None else None
+    sw = float(np.sum(w)) if w is not None else float(n)
+    if w is not None:
+        grad_3d = np.einsum("nck,np->ckp", weight * w[:, None, None], X) / sw
+    else:
+        grad_3d = np.einsum("nck,np->ckp", weight, X) / n  # (K, K-1, p)
+    return grad_3d.reshape(K, p * (K - 1))
 
 
 _METHOD_META = {

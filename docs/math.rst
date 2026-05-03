@@ -257,6 +257,109 @@ Sup-t requires draws (so ``vce`` must be ``"simulation"`` or
 when the margins in the family are correlated — exactly the case for
 margins evaluated at neighbouring covariate profiles.
 
+Prediction scales and the chain rule
+------------------------------------
+
+The ``scale=`` kwarg on :meth:`~smmargins.Margins.predict` and
+:meth:`~smmargins.Margins.dydx` swaps the response-scale map
+:math:`f(\eta)` for an arbitrary :math:`g(\eta)`. Built-in scales
+(``"linear"``, ``"or"``, ``"exp"``, ``"log"``, …) and any user-defined
+:class:`~smmargins.Transform` provide :math:`g`, :math:`g'`, and (for
+``dydx``) :math:`g''` analytically.
+
+**Predicted values.** For a single design :math:`X`, the gradient of
+:math:`g(X\beta)` w.r.t. :math:`\beta` is
+
+.. math::
+
+    \frac{\partial g(\eta)}{\partial \beta} = g'(\eta) \cdot X.
+
+Only :math:`g'` is needed; this is why ``predict(scale=t)`` accepts
+``Transform`` instances with ``hess=None``.
+
+**AME on the g-scale.** For a continuous covariate :math:`x_k`, the
+AME on the g-scale is
+
+.. math::
+
+    \mathrm{AME}_k^{(g)}
+        = \frac{1}{n}\sum_i g'(\eta_i) \cdot \beta_k.
+
+Differentiating w.r.t. :math:`\beta`:
+
+.. math::
+
+    \frac{\partial \mathrm{AME}_k^{(g)}}{\partial \beta_j}
+        = \frac{1}{n}\sum_i \bigl[\,g''(\eta_i) \cdot x_{ij} \cdot \beta_k
+            + g'(\eta_i) \cdot \delta_{jk}\,\bigr].
+
+Both terms appear: the first comes from differentiating
+:math:`g'(\eta_i)` through :math:`\eta_i = x_i^\top\beta`, the second
+from differentiating the explicit :math:`\beta_k`. ``smmargins``
+computes this Jacobian analytically when ``Transform.hess`` is
+provided (every built-in does). Without ``hess``, ``dydx`` raises —
+this is the package's strict-derivative contract. A module-level
+``_DYDX_FD_ONLY`` flag (in :mod:`smmargins._derivs`) forces a
+finite-difference fallback for testing parity.
+
+**Discrete contrasts** under a g-scale are simpler: the contrast is
+:math:`g(\eta_a) - g(\eta_b)` averaged over the sample, and its
+gradient is :math:`g'(\eta_a)\,x_a - g'(\eta_b)\,x_b`. Only
+:math:`g'` enters; :math:`g''` is not used on the discrete path.
+
+**Composition with elasticities.** Each ``method=`` (``"eyex"``,
+``"dyex"``, ``"eydx"``) wraps the g-scale formulas above with the
+appropriate :math:`x` or :math:`g(\eta)` factor, e.g.
+
+.. math::
+
+    \mathrm{eyex}_k^{(g)} = \mathrm{AME}_k^{(g)} \cdot
+        \frac{\overline{x_k}}{\overline{g(\eta)}}.
+
+The Jacobian inherits an extra factor or quotient but no new
+analytic term, so the same :math:`g'` / :math:`g''` machinery powers
+every elasticity × scale combination.
+
+Subgroup AMEs (``over=``)
+-------------------------
+
+``over=`` partitions the sample into :math:`G` subgroups and computes
+the AME within each. Because every subgroup AME is a function of the
+*same* :math:`\hat\beta`, the joint covariance of the :math:`G`
+estimates is **not block-diagonal**:
+
+.. math::
+
+    \widehat{\mathrm{Var}}\bigl(\hat\theta_{1\ldots G}\bigr)
+        = J\,\widehat V\,J^\top,
+    \quad
+    J = \begin{bmatrix}
+        \partial \theta_1 / \partial \beta \\
+        \vdots \\
+        \partial \theta_G / \partial \beta
+    \end{bmatrix}.
+
+Computing each subgroup independently and concatenating would discard
+the off-diagonal blocks and break Wald tests across subgroups, so
+``smmargins`` always builds the stacked Jacobian.
+
+Joint Wald and pairwise contrasts
+---------------------------------
+
+For a result with point estimate :math:`\hat\theta` and covariance
+:math:`V`, :meth:`~smmargins.MarginsResult.wald` computes
+
+.. math::
+
+    W = (C\hat\theta - c_0)^\top (C V C^\top)^{-1} (C\hat\theta - c_0),
+
+distributed as :math:`\chi^2_{\mathrm{rank}(CVC^\top)}` under
+:math:`H_0`. ``pairwise(by=…)`` builds :math:`C` for all
+level-vs-level comparisons of a factor and returns a
+:class:`~smmargins.MarginsResult` whose ``ci_method=`` flows through
+the simultaneous-CI machinery — including ``"sup-t"`` when the
+underlying result carries draws.
+
 Why the response scale matters for DiD (Ai & Norton 2003)
 ---------------------------------------------------------
 

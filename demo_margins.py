@@ -23,13 +23,16 @@ Sections
   13. Cluster-robust SEs (``cov_type="cluster"``)
   14. Multiple-comparison adjustments side-by-side (Bonferroni / Sidak / sup-t)
   15. User-supplied parameter covariance (``vcov=``)
+  16. Prediction scales (``scale=``) and a custom ``Transform``
+  17. Subgroup AMEs via ``over=`` and observation weights
+  18. Joint Wald test and pairwise comparisons
 """
 
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
 
-from smmargins import Margins
+from smmargins import Margins, Transform
 
 pd.options.display.width = 120
 pd.options.display.float_format = "{: .4f}".format
@@ -296,3 +299,72 @@ ame_user    = M_v.dydx("age").se[0]
 print(f"AME(age) SE — default cov_params() : {ame_default: .6f}")
 print(f"AME(age) SE — vcov = 1.5 x default : {ame_user: .6f}   "
       f"(ratio {ame_user / ame_default:.3f}, expect ≈ sqrt(1.5)={np.sqrt(1.5):.3f})")
+
+
+# ---------------------------------------------------------------------------
+# 16. Prediction scales (`scale=`) and a custom Transform
+#     The default response scale gives Λ(η) for logit. Switch to "linear"
+#     to get the linear predictor (Stata 'xb'), to "or" for odds-ratio
+#     scale, or pass a Transform for any user-defined λ.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("16. Prediction scales (scale=) and custom Transform")
+print("=" * 80)
+ame_resp   = M.dydx("age").estimate[0]
+ame_linear = M.dydx("age", scale="linear").estimate[0]
+ame_or     = M.dydx("age", scale="or").estimate[0]
+print(f"AME(age) on response scale      : {ame_resp: .6f}   (probability units)")
+print(f"AME(age) on linear scale        : {ame_linear: .6f}   (= beta_age, log-odds)")
+print(f"AME(age) on odds-ratio scale    : {ame_or: .6f}")
+
+# Custom Transform: square the linear predictor (silly but illustrative)
+square = Transform(
+    value=lambda e: e ** 2,
+    grad=lambda e: 2 * e,
+    hess=lambda e: np.full_like(e, 2.0),
+    name="square",
+)
+ame_sq = M.dydx("age", scale=square).estimate[0]
+print(f"AME(age) under square transform : {ame_sq: .6f}")
+
+# ---------------------------------------------------------------------------
+# 17. Subgroup AMEs (over=) and observation weights
+#     over= partitions the sample and averages within each subgroup,
+#     keeping the FULL joint covariance (so cross-subgroup tests are valid).
+#     weights= threads through every average; pass at construction time.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("17. Subgroup AMEs (over=) and observation weights")
+print("=" * 80)
+print("AME(age) by educ:")
+print(M.dydx("age", over="educ").summary())
+
+w = rng.uniform(0.5, 2.0, N)
+M_w = Margins(fit, weights=w)
+ame_unw = M.dydx("age").estimate[0]
+ame_w   = M_w.dydx("age").estimate[0]
+print()
+print(f"AME(age) — unweighted         : {ame_unw: .6f}")
+print(f"AME(age) — sampling weighted  : {ame_w: .6f}")
+
+# ---------------------------------------------------------------------------
+# 18. Joint Wald test and pairwise comparisons
+#     wald() tests linear restrictions on a result; pairwise() builds the
+#     all-level-vs-level contrast matrix for a factor and applies whatever
+#     ci_method= you ask for (sup-t needs simulation/bootstrap draws).
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("18. Joint Wald and pairwise comparisons")
+print("=" * 80)
+res = M.dydx(["age", "income", "female"])
+joint = res.wald()
+print(f"Joint H0: AME(age) = AME(income) = AME(female) = 0")
+print(f"  chi^2 = {joint.stat:.4f},  df = {joint.df},  p = {joint.pvalue:.3g}")
+
+res_educ = M.dydx("educ")
+print()
+print("Pairwise comparisons across educ levels (Bonferroni-adjusted CIs):")
+print(res_educ.pairwise(by="educ", ci_method="bonferroni").summary())
