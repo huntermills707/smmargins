@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-03
+
+### Added
+
+- **`values=` per-variable DSL**. A new kwarg on `predict()`, `dydx()`, and `did()` that accepts per-variable specifications: scalars (fix at a value), sequences (grid axes, Cartesian-product expanded), reducer strings (`"mean"`, `"median"`, `"mode"`, `"zero"`, `"min"`, `"max"`, `"asobserved"`, `"p0"`..`"p100"`), callables (`lambda df: df["x"] * 1.1`), and `Expr("...")` wrappers for pandas-eval expressions. `default_values="asobserved"` controls unspecified columns; set to `"mean"`, `"median"`, `"mode"`, or `"zero"` for automatic reduction. Tests: `tests/test_values_dsl.py`, `tests/test_values_transforms.py`.
+- **`Expr` expression wrapper**. `from smmargins import Expr`; use `Expr("income * 1.10")` inside `values=` to evaluate pandas expressions. Strings alone are reducers; `Expr` disambiguates expression syntax. Tests: `tests/test_values_transforms.py`.
+- **`newdata=` escape hatch**. Pass an arbitrary `pd.DataFrame` to `predict()` or `dydx()` for out-of-sample / counterfactual evaluation. Mutually exclusive with `at`/`atexog`/`values`/`over`. Schema-validated up front (formula mode via trial patsy build, raw mode via column names). Bootstrap resamples training data, not `newdata`. Tests: `tests/test_newdata.py`.
+- **`Margins.contrast(a=, b=)` helper**. Computes `g_A`, `g_B`, and `g_A - g_B` with the full joint covariance, capturing the off-diagonal term between arms. Supports DSL arms (`a={"treat": 1}`), newdata arms (`a_newdata=df`), and mixed forms. Composes with `vce="bootstrap"` (one resample → both arms) and `ci_method="sup-t"`. Tests: `tests/test_contrast.py`.
+- **`smmargins.plot` subpackage**. Three plotting functions with a Matplotlib backend and a backend protocol ready for Plotly (0.6):
+  - `plot_predictions(margins, condition, by=, ci=, ...)` — prediction curves with optional confidence bands.
+  - `plot_slopes(margins, variables, condition, by=, ...)` — marginal-effect curves.
+  - `plot_comparisons(margins, variables, condition, by=, ...)` — contrast curves.
+  `condition` accepts a variable name (auto-gridded: 50-point linspace for numeric, all levels for categorical) or a dict for explicit grids. `by=` renders multiple lines for categorical facets. Tests: `tests/test_plot.py`.
+- **`matplotlib >= 3.5`** added as a firm install dependency. This is a breaking change for minimal installs that previously ran without Matplotlib.
+
+### Changed
+
+- `atexog=` and `values=` can be used together when their keys are disjoint; conflicts on the same variable raise `ValueError`.
+- Internally, `expand_at` is replaced by `expand_values` in `DesignResolver`; `atexog` is normalized into the same `ValueSpec` path.
+
 ## [0.4.0] - 2026-05-02
 
 ### Added

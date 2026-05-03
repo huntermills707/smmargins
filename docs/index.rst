@@ -17,6 +17,11 @@ fitted model that exposes ``params``, ``cov_params()``, and
     intro
     math
     demos
+    cookbook_values
+    cookbook_transforms
+    cookbook_newdata
+    cookbook_contrast
+    cookbook_plotting
 
 .. toctree::
     :maxdepth: 2

@@ -11,7 +11,7 @@ exposes `params`, `cov_params()`, and a `predict(params, exog)` method.
 pip install smmargins
 ```
 
-Requires Python ≥3.9. Dependencies (`numpy`, `pandas`, `statsmodels`, `scipy`, `patsy`) are installed automatically.
+Requires Python ≥3.9. Dependencies (`numpy`, `pandas`, `statsmodels`, `scipy`, `patsy`, `matplotlib>=3.5`) are installed automatically.
 
 ## Math
 
@@ -381,6 +381,68 @@ M.predict(atexog={"x1": [-1, 0, 1]}, vce="simulation",
 - `"sup-t"` — simulation-based simultaneous critical value from the
   maximum standardized absolute deviation across the margin family.
   Requires `vce="simulation"` or `"bootstrap"`.
+
+## Counterfactuals and plotting (0.5)
+
+### Per-variable DSL (`values=`)
+
+Hold specific variables at fixed values, grid points, or computed statistics without restating every column:
+
+```python
+# Fix x1 at 1, reduce everything else to its mean
+M.predict(values={"x1": 1}, default_values="mean")
+
+# Grid over income quartiles with everything else at observed values
+M.predict(values={"income": ["p25", "p50", "p75"]})
+
+# Scale a variable per row with a callable or Expr
+from smmargins import Expr
+M.predict(values={"income": lambda df: df["income"] * 1.10})
+M.predict(values={"income": Expr("income * 1.10")})
+```
+
+Accepted value kinds per key: scalar, sequence, reducer string (`"mean"`, `"p25"`, ...), callable, or `Expr(...)`. `default_values="asobserved"` (default) leaves unspecified columns row-varying.
+
+### `newdata=` escape hatch
+
+Pass an arbitrary frame for out-of-sample evaluation:
+
+```python
+hypo = pd.DataFrame({"age": [25, 45, 65], "income": [30_000, 50_000, 80_000]})
+M.predict(newdata=hypo)
+M.dydx("age", newdata=hypo)
+```
+
+Mutually exclusive with `at`/`atexog`/`values`/`over`.
+
+### Joint contrasts (`Margins.contrast`)
+
+Compute two counterfactual arms and their difference with the correct joint SE:
+
+```python
+joint = M.contrast(a={"treat": 1}, b={"treat": 0})
+joint.estimate   # [g_A, g_B, g_A - g_B]
+joint.se         # SEs that include the A-B covariance
+```
+
+Also accepts `a_newdata=` / `b_newdata=` for frame-based arms.
+
+### Plotting
+
+```python
+from smmargins import plot_predictions, plot_slopes, plot_comparisons
+
+# Predicted probability vs age, with 95% CI band
+plot_predictions(M, "age")
+
+# AME of age vs income, faceted by sex
+plot_slopes(M, "age", condition="income", by="sex")
+
+# Treatment effect vs age
+plot_comparisons(M, "treat", condition="age")
+```
+
+`condition` can be a variable name (auto-gridded) or a dict with explicit grid points. `ci=None` removes the band; `ci_method="bonferroni" | "sidak" | "sup-t"` passes through to the underlying margin call.
 
 ## Scales, weights, subgroups, joint tests (0.4)
 
