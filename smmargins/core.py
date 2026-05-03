@@ -10,8 +10,14 @@ import patsy
 
 from .results import MarginsResult, DiDResult
 from .data import _Profile
-from .utils import _central_jacobian, _METHOD_META, _get_param_cov
+from .utils import _central_jacobian, _METHOD_META, _get_param_cov, check_at, check_factor_stat, default_factor_stat
 from .inference import _simulate_vce, _bootstrap_vce, _summarize_draws
+from .transforms import Transform
+
+from ._design import DesignResolver
+from ._engine import PredictionEngine
+from ._derivs import DerivativeEngine
+
 
 class Margins:
     r"""Compute adjusted predictions and marginal effects for a StatsModels fit.
@@ -206,6 +212,8 @@ class Margins:
         cov_type: Optional[str] = None,
         vcov: Optional[np.ndarray] = None,
         cov_kwds: Optional[dict] = None,
+        weights: Optional[Union[np.ndarray, Sequence[float]]] = None,
+        weight_type: str = "sampling",
     ):
         self.results = results
         self.model = results.model
@@ -227,24 +235,23 @@ class Margins:
         self.df = getattr(results, "df_resid", None) if use_t else None
         self.analytic = analytic
 
-        self.design_info = self._try_get_design_info()
-        self._raw_mode = self.design_info is None
+        self._design = DesignResolver.from_results(results, data)
+        self._raw_mode = self._design.raw_mode
 
-        if data is None:
-            data = self._try_get_data()
-        if data is None and self._raw_mode:
+        if self._design.frame is None and self._raw_mode:
             # Synthesize data from model.exog
             exog = np.asarray(self.model.exog)
             names = list(getattr(self.model, "exog_names", None) or
                          [f"x{i}" for i in range(exog.shape[1])])
             data = pd.DataFrame(exog, columns=names)
+            self._design = DesignResolver.from_results(results, data)
 
-        if data is None:
+        if self._design.frame is None:
             raise ValueError(
                 "Could not retrieve the original data frame from the model; "
                 "please pass ``data=`` explicitly."
             )
-        self.data = data.copy()
+        self.data = self._design.frame
 
         if self._raw_mode:
             # Sanity check alignment
@@ -272,824 +279,61 @@ class Margins:
                     f"{n_exog} exog columns. Cannot use raw mode."
                 )
 
-        # Cache training offset/exposure for _predict broadcasting on smaller
-        # designs (MEM/APM/etc.). Without this, statsmodels' predict can't
-        # align a length-N stored offset against a 1-row exog and silently
-        # drops the offset. We collapse offset + log(exposure) into a single
-        # log-offset and pass it as ``offset=`` to predict — that way we
-        # don't have to care which storage convention the model uses
-        # (statsmodels stores ``model.exposure`` as ``log(exposure)`` for
-        # GLM, raw for discrete models, etc.).
-        self._n_train = (self.model.exog.shape[0]
-                         if getattr(self.model, "exog", None) is not None else None)
-        self._mean_log_offset_value = self._compute_mean_log_offset()
+        self._engine = PredictionEngine.from_results(
+            results, self._design,
+            weights=weights, weight_type=weight_type,
+            analytic=self.analytic,
+        )
 
-        # Detect number of outcome classes for multi-outcome models
-        self._n_outcomes = self._detect_n_outcomes()
-        self._outcome_labels = self._detect_outcome_labels()
+        self.weights = self._engine.weights
+        self.weight_type = self._engine.weight_type
 
-    def _detect_n_outcomes(self) -> int:
-        """Detect the number of outcome classes (K) for the fitted model.
-
-        Returns
-        -------
-        int
-            Number of outcome classes. 1 for single-outcome models.
-        """
-        # MNLogit
-        if hasattr(self.model, "J"):
-            return int(self.model.J)
-        # OrderedModel
-        if hasattr(self.model, "k_extra"):
-            return int(self.model.k_extra) + 1
-        # Last resort: probe with a 1-row prediction
-        try:
-            exog = getattr(self.model, "exog", None)
-            if exog is not None and exog.shape[0] > 0:
-                probe = exog[:1]
-                pred = self.model.predict(self.results.params, probe)
-                pred_arr = np.asarray(pred)
-                if pred_arr.ndim == 2:
-                    return pred_arr.shape[1]
-        except Exception:
-            pass
-        return 1
-
-    def _detect_outcome_labels(self) -> Optional[List[str]]:
-        """Detect outcome class labels for multi-outcome models.
-
-        Returns
-        -------
-        list of str or None
-            Labels for each outcome class, or None for single-outcome models.
-        """
-        if self._n_outcomes == 1:
-            return None
-        # MNLogit
-        ynames = getattr(self.model, "_ynames_map", None)
-        if ynames is not None:
-            # ynames_map maps class index -> label
-            labels = [str(ynames.get(i, i)) for i in range(self._n_outcomes)]
-            return labels
-        # Try to infer from endog
-        endog = getattr(self.model, "endog", None)
-        if endog is not None:
-            try:
-                uniq = np.unique(endog)
-                if len(uniq) == self._n_outcomes:
-                    return [str(u) for u in uniq]
-            except Exception:
-                pass
-        return [str(i) for i in range(self._n_outcomes)]
+        self._derivs = DerivativeEngine(
+            design=self._design, engine=self._engine,
+        )
 
     @property
     def n_outcomes(self) -> int:
         """Number of outcome classes (K) for the fitted model."""
-        return self._n_outcomes
+        return self._engine.n_outcomes
 
     @property
     def outcome_labels(self) -> Optional[List[str]]:
         """Outcome class labels for multi-outcome models, or None."""
-        return self._outcome_labels
+        return self._engine.outcome_labels
 
-    def _compute_mean_log_offset(self) -> Optional[float]:
-        """Mean of (offset + log(exposure)) across the training sample.
+    def _build_exog(self, frame: pd.DataFrame) -> np.ndarray:
+        return self._design.build_exog(frame)
 
-        Returns
-        -------
-        float or None
-            The mean log-offset when offset/exposure is present and
-            non-zero; ``None`` otherwise.
+    def _predict(self, params: np.ndarray, exog: np.ndarray) -> np.ndarray:
+        return self._engine.predict(params, exog)
 
-        Notes
-        -----
-        This value is used for offset/exposure broadcasting when the
-        design matrix has fewer rows than the training sample (e.g.
-        APM/MEM single-row evaluations). Without it, statsmodels
-        cannot align a length-N stored offset against a 1-row exog
-        and silently drops the offset term.
-        """
-        oe = getattr(self.model, "_offset_exposure", None)
-        if oe is not None:
-            a = np.asarray(oe, dtype=float).ravel()
-            if a.size > 0 and np.any(a):
-                return float(np.mean(a))
-            return None
-        # Fall back: combine offset and exposure manually. statsmodels stores
-        # ``exposure`` as already log-transformed for GLM; discrete models
-        # apply log internally too. Either way ``model.exposure`` is in log
-        # space when present.
-        parts = []
-        for attr in ("offset", "exposure"):
-            v = getattr(self.model, attr, None)
-            if v is None:
-                continue
-            a = np.asarray(v, dtype=float).ravel()
-            if a.size > 0 and np.any(a):
-                parts.append(a)
-        if not parts:
-            return None
-        try:
-            return float(np.mean(sum(parts)))
-        except ValueError:
-            return None
+    def _link_deriv(self):
+        return self._engine.link_deriv()
+
+
+    # ---- weights -----------------------------------------------------------
+
 
     # ---- model / data introspection ----
 
-    def _try_get_data(self):
-        """Attempt to retrieve the original fitting data frame from the model.
-
-        Returns
-        -------
-        pd.DataFrame or None
-            The original data frame when available; ``None`` otherwise.
-        """
-        try:
-            return self.model.data.frame
-        except AttributeError:
-            pass
-        # Some models (e.g. MNLogit, OrderedModel) store the data in orig_exog
-        orig_exog = getattr(self.model.data, "orig_exog", None)
-        if orig_exog is not None and hasattr(orig_exog, "columns"):
-            return pd.DataFrame(orig_exog)
-        return None
-
-    def _try_get_design_info(self):
-        """Retrieve the patsy DesignInfo from the model, if available.
-
-        Returns
-        -------
-        DesignInfo or None
-            The patsy ``DesignInfo`` object when the model was fit with a
-            formula; ``None`` in raw-exog mode.
-
-        Notes
-        -----
-        In formula mode, the DesignInfo encodes how the data frame maps
-        to the design matrix (interactions, transformations, categorical
-        encodings). In raw mode, ``Margins`` falls back to column-name
-        matching against ``model.exog_names``.
-        """
-        exog = getattr(self.model.data, "orig_exog", None)
-        if exog is not None and hasattr(exog, "design_info"):
-            return exog.design_info
-        # Some model wrappers stash it differently:
-        di = getattr(self.model.data, "design_info", None)
-        if di is not None:
-            return di
-        return None
 
     # ---- building design matrices ----
 
-    def _build_exog(self, frame: pd.DataFrame) -> np.ndarray:
-        """Build a numeric design matrix from a data frame.
-
-        Parameters
-        ----------
-        frame : pd.DataFrame
-            Data-space frame containing the required columns.
-
-        Returns
-        -------
-        ndarray
-            Numeric design matrix suitable for ``model.predict``.
-
-        Notes
-        -----
-        If the model was fit with a formula, this uses patsy's DesignInfo
-        to rebuild the matrix (handling interactions, etc.). If fit with
-        raw matrices, it selects columns matching ``model.exog_names``.
-        For OrderedModel, ``exog_names`` includes threshold parameters;
-        we truncate to the actual number of exog columns.
-        """
-        if self._raw_mode:
-            names = list(self.model.exog_names)
-            n_exog = self.model.exog.shape[1]
-            cols = names[:n_exog]
-            return np.asarray(frame[cols].to_numpy(dtype=float))
-        dm = patsy.dmatrix(self.design_info, frame, return_type="matrix")
-        return np.asarray(dm)
 
     # ---- core prediction on the response scale ----
 
-    def _predict(self, params: np.ndarray, exog: np.ndarray) -> np.ndarray:
-        """Return E[Y | X] (response scale) using the model's own predict.
-
-        Parameters
-        ----------
-        params : ndarray of shape (p,) or (p, K-1)
-            Parameter vector override.
-        exog : ndarray of shape (n, p)
-            Design matrix.
-
-        Returns
-        -------
-        ndarray of shape (n, K)
-            Predicted values on the response scale. Single-outcome models
-            return ``(n, 1)``; multi-outcome models return ``(n, K)``.
-
-        Notes
-        -----
-        Many StatsModels results accept a ``params`` override to
-        ``model.predict``; for GLMs this applies the inverse link. When
-        the model carries offset/exposure but the design has a different
-        row count than training (e.g. APM/MEM single rows), we broadcast
-        the *mean* training offset/exposure to the new design \u2014 otherwise
-        statsmodels cannot align the stored length-N offset against the
-        smaller exog and silently drops it.
-        """
-        exog_arr = np.asarray(exog)
-        n_exog = exog_arr.shape[0]
-        kwargs = {}
-        if (self._n_train is not None
-                and n_exog != self._n_train
-                and self._mean_log_offset_value is not None):
-            kwargs["offset"] = np.full(n_exog, self._mean_log_offset_value)
-
-        # Multi-outcome models may need params in matrix form
-        params_use = np.asarray(params)
-        if self._is_mnlogit():
-            p = exog_arr.shape[1]
-            K = self.n_outcomes
-            params_use = params_use.reshape(p, K - 1, order="F")
-
-        try:
-            pred = np.asarray(self.model.predict(params_use, exog, **kwargs))
-        except (TypeError, ValueError, KeyError):
-            eta = exog_arr @ np.asarray(params_use)
-            if "offset" in kwargs:
-                eta = eta + kwargs["offset"]
-            fam = getattr(self.model, "family", None)
-            if fam is not None:
-                pred = np.asarray(fam.link.inverse(eta))
-            else:
-                pred = eta
-        # Enforce (n, K) shape invariant
-        if pred.ndim == 1:
-            pred = pred.reshape(-1, 1)
-        return pred
 
     # ---- analytic outer-Jacobian support ----
 
-    def _link_deriv(self) -> Optional[Callable[[np.ndarray], np.ndarray]]:
-        r"""Return the link derivative :math:`f'(\eta)`, or ``None``.
 
-        Returns a callable ``fprime(eta)`` when an analytic derivative
-        of the inverse link is available; otherwise ``None``, signalling
-        that the caller should fall back to finite differences.
 
-        Returns
-        -------
-        callable or None
-            ``fprime(eta)`` returning :math:`f'(\eta)` element-wise, or
-            ``None`` if the model does not expose an analytic derivative.
+    # ---- scale resolution ---------------------------------------------------
 
-        Notes
-        -----
-        Eligible when the model exposes ``family.link.inverse_deriv`` (every
-        stock GLM family) or is a linear-regression model (identity link).
-        Bails out returning ``None`` whenever an offset or exposure is
-        present, since then :math:`\eta \neq X\beta` and our chain rule
-        would need an offset-aware path we do not currently provide.
-        """
-        if not self.analytic:
-            return None
-        # Offset/exposure changes the linear-predictor formula.
-        off = getattr(self.model, "_offset_exposure", None)
-        if off is not None and np.any(np.asarray(off)):
-            return None
-        for attr in ("offset", "exposure"):
-            v = getattr(self.model, attr, None)
-            if v is not None and np.any(np.asarray(v)):
-                return None
 
-        fam = getattr(self.model, "family", None)
-        if fam is not None:
-            link = getattr(fam, "link", None)
-            if link is not None and callable(getattr(link, "inverse_deriv", None)):
-                return link.inverse_deriv
-            return None
+    # ---- linear predictor and scaled prediction ------------------------------
 
-        try:
-            from statsmodels.regression.linear_model import RegressionModel
-        except ImportError:
-            return None
-        if isinstance(self.model, RegressionModel):
-            return lambda eta: np.ones_like(np.asarray(eta, dtype=float))
-        return None
 
-    def _grad_mean_predict(
-        self,
-        X: np.ndarray,
-        beta: np.ndarray,
-        fprime: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-    ) -> np.ndarray:
-        r"""Gradient of the mean prediction with respect to parameters.
-
-        Computes
-        :math:`\partial/\partial\beta` of
-        :math:`(1/n)\sum_i f(x_i^\top\beta)`, returning shape ``(K, p)``.
-
-        Parameters
-        ----------
-        X : ndarray of shape (n, p)
-            Design matrix.
-        beta : ndarray of shape (p,) or (p, K-1)
-            Parameter vector.
-        fprime : callable, optional
-            Function returning :math:`f'(\eta)` for each linear
-            predictor value. Required for single-outcome models.
-
-        Returns
-        -------
-        ndarray of shape (K, p_full)
-            Gradient matrix. Single-outcome models return ``(1, p)``;
-            MNLogit returns ``(K, p*(K-1))``.
-
-        Notes
-        -----
-        Building block for every analytic Jacobian in this module: every
-        statistic we compute is a linear combination of mean-predictions
-        on different design matrices, so each row of the analytic ``J``
-        is a linear combination of these gradients.
-        """
-        X = np.asarray(X, dtype=float)
-        if self._is_mnlogit():
-            return self._softmax_grad_mean(X, beta)
-        # Single-outcome path (OLS, GLM, etc.)
-        if fprime is None:
-            raise ValueError(
-                "fprime is required for single-outcome _grad_mean_predict"
-            )
-        eta = X @ beta
-        fp = np.asarray(fprime(eta), dtype=float).ravel()
-        grad = (fp[:, None] * X).sum(axis=0) / X.shape[0]
-        return grad.reshape(1, -1)
-
-    def _is_mnlogit(self) -> bool:
-        """Return True if the fitted model is MNLogit."""
-        return hasattr(self.model, "J") and getattr(self.model, "k_extra", None) == 0
-
-    def _is_ordered_model(self) -> bool:
-        """Return True if the fitted model is OrderedModel."""
-        k_extra = getattr(self.model, "k_extra", None)
-        return k_extra is not None and k_extra > 0
-
-    @staticmethod
-    def _softmax_grad_mean(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
-        r"""Analytic gradient of mean softmax probabilities for MNLogit.
-
-        For a K-class multinomial logit with class 0 as reference,
-        computes the gradient of
-        :math:`(1/n)\sum_i P(Y=c \mid x_i)` w.r.t. the flat parameter
-        vector for every class c.
-
-        Parameters
-        ----------
-        X : ndarray of shape (n, p)
-            Design matrix.
-        beta : ndarray of shape (p*(K-1),)
-            Flat parameter vector in column-major (Fortran) order:
-            ``[beta_1, beta_2, ..., beta_{K-1}]`` where each ``beta_k``
-            has length ``p``.
-
-        Returns
-        -------
-        ndarray of shape (K, p*(K-1))
-            Gradient matrix. Row ``c`` is the gradient for outcome class ``c``.
-        """
-        X = np.asarray(X, dtype=float)
-        n, p = X.shape
-        # beta is flat vector of length p*(K-1)
-        # Reshape to (p, K-1) in Fortran order (class blocks contiguous)
-        K = beta.size // p + 1
-        B = beta.reshape(p, K - 1, order="F")
-        # Linear predictors for classes 1..K-1
-        eta = X @ B  # (n, K-1)
-        # Probabilities
-        exp_eta = np.exp(eta)
-        denom = 1 + exp_eta.sum(axis=1, keepdims=True)  # (n, 1)
-        P_alt = exp_eta / denom  # (n, K-1)
-        P_0 = 1 / denom  # (n, 1)
-        P = np.hstack([P_0, P_alt])  # (n, K)
-
-        # delta_{c,k} for c=0..K-1, k=1..K-1
-        delta = np.zeros((K, K - 1))
-        for k in range(1, K):
-            delta[k, k - 1] = 1.0
-
-        # weight[i, c, k] = P_{c,i} * (delta_{c,k} - P_{k,i})
-        diff = delta[None, :, :] - P[:, None, 1:]  # (n, K, K-1)
-        weight = P[:, :, None] * diff  # (n, K, K-1)
-
-        # grad_{c,k} = (1/n) sum_i weight[i,c,k] * x_i
-        grad_3d = np.einsum("nck,np->ckp", weight, X) / n  # (K, K-1, p)
-        return grad_3d.reshape(K, p * (K - 1))
-
-    # ---- shared paired-contrast machinery ------------------------------------
-    #
-    # Every dydx variant — continuous (level), count, discrete — is a list of
-    # contrasts ``E[f(X_a)] - E[f(X_b)]`` over pairs of design matrices, often
-    # multiplied by a constant. ``_design_pairs`` builds those pairs from a
-    # callable that returns the ``(a, b)`` data-space frames for one input
-    # frame; ``_paired_contrast`` turns the list of pairs into a
-    # ``(statistic, jac)`` tuple suitable for ``_delta``.
-
-    def _design_pairs(
-        self,
-        profile: _Profile,
-        frames: List[pd.DataFrame],
-        perturb: Callable[[pd.DataFrame], tuple[pd.DataFrame, pd.DataFrame]],
-    ) -> List[tuple[np.ndarray, np.ndarray]]:
-        """Build paired design matrices for a perturbation-based contrast.
-
-        For each input frame, applies ``profile.prepare_frame``, then
-        the perturbation callable, then ``_build_exog``, and optionally
-        design-matrix collapse.
-
-        Parameters
-        ----------
-        profile : _Profile
-            Evaluation profile controlling numerics/design collapse.
-        frames : list of pd.DataFrame
-            Base frames (already expanded via ``_expand_at``).
-        perturb : callable
-            Function ``(pd.DataFrame) -> (fa, fb)`` producing the two
-            perturbed data-space frames for the contrast.
-
-        Returns
-        -------
-        list of tuple
-            List of ``(Xa, Xb)`` design-matrix pairs.
-
-        Notes
-        -----
-        Numerics-collapse runs *before* perturb, so the perturbation
-        (e.g. ``variable + 1``) isn't overwritten by the mean-substitution.
-        """
-        # Numerics-collapse runs *before* perturb, so the perturbation
-        # (e.g. ``variable + 1``) isn't overwritten by the mean-substitution.
-        out: List[tuple[np.ndarray, np.ndarray]] = []
-        for fr in frames:
-            prepared = profile.prepare_frame(fr, self)
-            fa, fb = perturb(prepared)
-            Xa = self._build_exog(fa)
-            Xb = self._build_exog(fb)
-            if profile.collapse_design:
-                Xa = Xa.mean(axis=0, keepdims=True)
-                Xb = Xb.mean(axis=0, keepdims=True)
-            out.append((Xa, Xb))
-        return out
-
-    def _paired_contrast(
-        self,
-        pairs: Sequence[tuple[np.ndarray, np.ndarray]],
-        scale: float = 1.0,
-    ) -> tuple[Callable[[np.ndarray], np.ndarray],
-               Optional[Callable[[np.ndarray], np.ndarray]]]:
-        """Compute ``E[f(X_a)] - E[f(X_b)]`` per pair, scaled by ``scale``.
-
-        Parameters
-        ----------
-        pairs : sequence of tuple
-            Each element is ``(Xa, Xb)``, a pair of design matrices.
-        scale : float, default 1.0
-            Multiplicative constant applied to each contrast.
-
-        Returns
-        -------
-        tuple
-            ``(statistic, jac)``. ``jac`` is None when no analytic
-            link derivative is available — the caller falls back to FD via
-            ``_central_jacobian``.
-        """
-        n = len(pairs)
-
-        def statistic(beta: np.ndarray) -> np.ndarray:
-            parts = []
-            for i, (Xa, Xb) in enumerate(pairs):
-                ya = np.mean(self._predict(beta, Xa), axis=0)
-                yb = np.mean(self._predict(beta, Xb), axis=0)
-                parts.append(np.atleast_1d((ya - yb) * scale))
-            return np.vstack(parts)
-
-        fprime = self._link_deriv()
-        if fprime is None and not self._is_mnlogit():
-            return statistic, None
-
-        def jac(beta: np.ndarray) -> np.ndarray:
-            parts = []
-            for i, (Xa, Xb) in enumerate(pairs):
-                ga = self._grad_mean_predict(Xa, beta, fprime)
-                gb = self._grad_mean_predict(Xb, beta, fprime)
-                parts.append((ga - gb) * scale)
-            return np.vstack(parts)
-
-        return statistic, jac
-
-    # ---- utilities for building "at" frames ----
-
-    @staticmethod
-    def _expand_at(
-        base: pd.DataFrame, at: Optional[Mapping[str, object]]
-    ) -> tuple[List[pd.DataFrame], List[str]]:
-        """Cartesian-product expansion of an ``at`` specification.
-
-        Parameters
-        ----------
-        base : pd.DataFrame
-            Base frame (e.g. from ``_single_row`` or the full data).
-        at : mapping, optional
-            Variable name -> scalar or list of scalars.
-
-        Returns
-        -------
-        tuple
-            ``(frames, labels)`` where each frame is ``base`` with the
-            chosen values broadcast, and ``labels`` describe the
-            ``atexog`` combination.
-
-        Notes
-        -----
-        ``at`` maps variable names to either scalars or lists of scalars.
-        Lists are expanded as a cartesian product over all variables.
-        """
-        if not at:
-            return [base.copy()], [""]
-        keys, vals = [], []
-        for k, v in at.items():
-            if np.isscalar(v) or isinstance(v, (str, bytes)):
-                vals.append([v])
-            else:
-                vals.append(list(v))
-            keys.append(k)
-        frames, labels = [], []
-        for combo in itertools.product(*vals):
-            f = base.copy()
-            for k, val in zip(keys, combo):
-                f[k] = val
-            frames.append(f)
-            labels.append(", ".join(f"{k}={val}" for k, val in zip(keys, combo)))
-        return frames, labels
-
-    def _single_row(self, at: str, factor_stat: str) -> pd.DataFrame:
-        """Build a one-row representative frame in data space.
-
-        Parameters
-        ----------
-        at : {"mean", "median", "zero"}
-            Evaluation point for numeric covariates.
-        factor_stat : {"mode", "zero"}
-            How to set factor / categorical columns.
-
-        Returns
-        -------
-        pd.DataFrame
-            One-row data frame with all columns set to their
-            representative values.
-
-        Notes
-        -----
-        Numeric columns get the value implied by ``at``
-        (mean / median / 0). Factor / categorical columns get the value
-        implied by ``factor_stat`` (modal level for ``"mode"``, the patsy
-        reference level for ``"zero"``).
-
-        ``factor_stat="mean"`` is not handled here — the caller routes
-        that through a design-matrix-collapse path so that factor dummies
-        end up at their observed proportions, which has no representation
-        in data space.
-        """
-        row = {}
-        for c in self.data.columns:
-            col = self.data[c]
-            is_numeric = (
-                pd.api.types.is_numeric_dtype(col)
-                and not pd.api.types.is_bool_dtype(col)
-            )
-            if is_numeric:
-                if at == "mean":
-                    row[c] = col.mean()
-                elif at == "median":
-                    row[c] = col.median()
-                elif at == "zero":
-                    row[c] = 0.0
-                else:
-                    raise ValueError(
-                        f"_single_row called with at={at!r}; only "
-                        f"'mean'/'median'/'zero' are valid here."
-                    )
-            elif factor_stat == "mode":
-                try:
-                    row[c] = col.mode().iloc[0]
-                except Exception:
-                    row[c] = col.iloc[0]
-            elif factor_stat == "zero":
-                row[c] = self._factor_reference_level(c)
-            else:
-                raise ValueError(
-                    f"_single_row called with factor_stat={factor_stat!r}; "
-                    f"the 'mean' path uses design-matrix collapse instead."
-                )
-        return pd.DataFrame([row])
-
-    def _factor_reference_level(self, col: str) -> object:
-        """Return the patsy reference level for a categorical column.
-
-        Parameters
-        ----------
-        col : str
-            Column name of a categorical variable in the data frame.
-
-        Returns
-        -------
-        object
-            The reference level \u2014 the one that contributes nothing to the
-            linear predictor under default treatment contrasts.
-
-        Notes
-        -----
-        Probes one-row designs with ``col`` set to each observed level
-        (other variables held at simple defaults) and picks the level
-        whose 1-row design has the minimum L1 norm \u2014 i.e. the one that
-        contributes nothing to the linear predictor under default
-        contrasts. This matches the level that ``get_margeff(at='zero')``
-        implicitly picks when it sets the design row to zero.
-
-        Falls back to the alphabetically first observed level when not
-        in formula mode or when probing fails (custom Link subclasses,
-        non-standard ``DesignInfo``, etc.).
-        """
-        levels = self.data[col].dropna().unique().tolist()
-        try:
-            levels = sorted(levels)
-        except TypeError:
-            pass
-        if not levels:
-            return self.data[col].iloc[0]
-        if self._raw_mode or self.design_info is None or len(levels) < 2:
-            return levels[0]
-        probe = pd.DataFrame([{
-            c: self._probe_default(c) for c in self.data.columns
-        }])
-        best_lvl, best_norm = levels[0], None
-        for lvl in levels:
-            p = probe.copy()
-            p[col] = lvl
-            try:
-                X = self._build_exog(p)
-            except Exception:
-                continue
-            norm = float(np.abs(np.asarray(X)).sum())
-            if best_norm is None or norm < best_norm:
-                best_norm = norm
-                best_lvl = lvl
-        return best_lvl
-
-    def _probe_default(self, col: str):
-        """Return a default probe value for a column.
-
-        Parameters
-        ----------
-        col : str
-            Column name in ``self.data``.
-
-        Returns
-        -------
-        object
-            ``0.0`` for numeric columns; the alphabetically first observed
-            level otherwise.
-        """
-        s = self.data[col]
-        if (pd.api.types.is_numeric_dtype(s)
-                and not pd.api.types.is_bool_dtype(s)):
-            return 0.0
-        u = s.dropna().unique().tolist()
-        if not u:
-            return s.iloc[0]
-        try:
-            return sorted(u)[0]
-        except TypeError:
-            return u[0]
-
-    def _resolve_base(self, at: str, factor_stat: str) -> _Profile:
-        """Return the evaluation profile for ``(at, factor_stat)``.
-
-        Parameters
-        ----------
-        at : {"overall", "mean", "median", "zero"}
-            Evaluation point for numeric covariates.
-        factor_stat : {"mean", "mode", "zero"}
-            How to handle factor / categorical variables.
-
-        Returns
-        -------
-        _Profile
-            Evaluation profile with ``collapse_design`` and
-            ``collapse_numerics`` flags set appropriately.
-
-        Notes
-        -----
-        ``profile.collapse_design`` is True iff factors should end up at
-        their observed proportions (Stata ``atmeans`` semantics).
-        ``profile.collapse_numerics`` is always False here \u2014 the count
-        and discrete contrast paths flip it on themselves before
-        materializing, since they need a single design row in data space
-        rather than the design-column averages that the continuous FD
-        path relies on.
-        """
-        if at == "overall":
-            return _Profile(frame=self.data, collapse_design=False)
-
-        if factor_stat == "mean":
-            # Modify numerics in data space; leave factors observed and
-            # let X.mean later pick up their proportions.
-            f = self.data.copy()
-            for c in f.columns:
-                col = f[c]
-                is_numeric = (
-                    pd.api.types.is_numeric_dtype(col)
-                    and not pd.api.types.is_bool_dtype(col)
-                )
-                if not is_numeric:
-                    continue
-                if at == "median":
-                    f[c] = col.median()
-                elif at == "zero":
-                    f[c] = 0.0
-                # at == "mean": X.mean handles it without touching the data.
-            return _Profile(frame=f, collapse_design=True)
-
-        return _Profile(frame=self._single_row(at, factor_stat),
-                        collapse_design=False)
-
-    def _collapse_numerics_to_mean(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Replace observed (row-varying) numeric columns with their training mean.
-
-        Parameters
-        ----------
-        frame : pd.DataFrame
-            Data-space frame, possibly containing ``atexog`` overrides.
-
-        Returns
-        -------
-        pd.DataFrame
-            Copy with row-varying numeric columns replaced by their
-            training-sample mean.
-
-        Notes
-        -----
-        Used by the count and discrete dydx paths under ``collapse=True``
-        to give a single representative profile in *data space*, so that
-        derived columns like ``I(x**2)`` evaluate to ``mean(x)**2`` rather
-        than ``mean(x**2)``. Columns that are already constant in the
-        frame (e.g. fixed by ``atexog``) are left alone.
-        """
-        out = frame.copy()
-        for c in self.data.columns:
-            if c not in out.columns:
-                continue
-            col = self.data[c]
-            if not (pd.api.types.is_numeric_dtype(col)
-                    and not pd.api.types.is_bool_dtype(col)):
-                continue
-            if out[c].nunique(dropna=False) <= 1:
-                continue
-            out[c] = col.mean()
-        return out
-
-    @staticmethod
-    def _check_at(at: str) -> None:
-        """Validate ``at`` argument, raising if unknown."""
-        if at not in ("overall", "mean", "median", "zero"):
-            raise ValueError(
-                f"at must be 'overall', 'mean', 'median', or 'zero', "
-                f"got {at!r}"
-            )
-
-    @staticmethod
-    def _check_factor_stat(factor_stat: str) -> None:
-        """Validate ``factor_stat`` argument, raising if unknown."""
-        if factor_stat not in ("mean", "mode", "zero"):
-            raise ValueError(
-                f"factor_stat must be 'mean', 'mode', or 'zero', "
-                f"got {factor_stat!r}"
-            )
-
-    @staticmethod
-    def _default_factor_stat(at: str) -> str:
-        """Pick a sensible ``factor_stat`` when the user did not supply one.
-
-        Maps ``at`` values to their natural factor handling:
-        ``overall`` -> ``mean``, ``mean`` -> ``mean``, ``median`` -> ``mode``,
-        ``zero`` -> ``zero``.
-        """
-        return {
-            "overall": "mean",  # ignored — no collapse happens
-            "mean":    "mean",  # Stata default: design-matrix proportions
-            "median":  "mode",  # median is undefined for categoricals
-            "zero":    "zero",  # reference level — matches at='zero' semantics
-        }[at]
 
     # ---- the inference worker ----
 
@@ -1263,6 +507,8 @@ class Margins:
             at: str = "overall",
             atexog: Optional[Mapping[str, object]] = None,
             factor_stat: Optional[str] = None,
+            over: Optional[Union[str, List[str]]] = None,
+            scale: Union[str, Transform] = "response",
             outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
             vce: str = "delta",
             cov_type: Optional[str] = None,
@@ -1280,7 +526,7 @@ class Margins:
             ci_method: str = "pointwise",
             ci_alpha: float = 0.05,
         ) -> MarginsResult:
-        r"""Compute adjusted predictions (expected outcome on the response scale).
+        r"""Compute adjusted predictions.
 
         Parameters
         ----------
@@ -1320,6 +566,16 @@ class Margins:
               individual" rather than a fictional fractional one.
             - ``"zero"``: factors at their reference (first observed)
               level.
+        scale : str or Transform, default "response"
+            Scale on which to report predictions. Built-in string values:
+            ``"response"`` (default, model's own ``predict()``),
+            ``"linear"`` (linear predictor η = Xβ, Stata's ``xb``),
+            ``"pr"`` (probability scale; probability models only),
+            ``"ir"`` (incidence rate; log-link count models only),
+            ``"or"`` (odds ratio; logit only),
+            ``"exp"`` (exp(η)), ``"log"`` (log of the response).
+            A custom :class:`~smmargins.transforms.Transform` object is
+            also accepted.
         outcome : int, str, or sequence, optional
             For multi-outcome models, subset to the specified outcome
             class(es).
@@ -1366,42 +622,76 @@ class Margins:
         Margins.dydx
         Margins.did
         """
-        self._check_at(at)
+        check_at(at)
         if factor_stat is None:
-            factor_stat = self._default_factor_stat(at)
-        self._check_factor_stat(factor_stat)
+            factor_stat = default_factor_stat(at)
+        check_factor_stat(factor_stat)
 
-        profile = self._resolve_base(at, factor_stat)
-        frames, at_labels = self._expand_at(profile.frame, atexog)
+        transform = self._engine.resolve_scale(scale)
+
+        profile, frames, labels, weights_list = self._design.expand_over(
+            at, factor_stat, atexog, over=over,
+            weights=self._engine.weights,
+            get_weights=self._engine.get_weights,
+        )
 
         stat_name = "prediction"
-        if atexog is None:
+        if over is None and atexog is None:
             if at == "overall":
                 labels = ["AAP"]
             elif at == "mean":
                 labels = ["APM"]
             else:
                 labels = [f"AP @ {at}"]
+
+        Xs = [profile.materialize(f, self._design) for f in frames]
+
+        if transform is None:
+            # Response-scale path (default)
+            def statistic(beta: np.ndarray) -> np.ndarray:
+                parts = []
+                for i, X in enumerate(Xs):
+                    w = weights_list[i]
+                    parts.append(
+                        np.atleast_1d(
+                            self._engine.weighted_mean(self._engine.predict(beta, X), weights=w)
+                        )
+                    )
+                return np.vstack(parts)
+
+            fprime = self._engine.link_deriv()
+            if fprime is not None or self._engine._is_mnlogit():
+                def jac(beta: np.ndarray) -> np.ndarray:
+                    parts = []
+                    for i, X in enumerate(Xs):
+                        w = weights_list[i]
+                        parts.append(self._engine.grad_mean_predict(X, beta, fprime, weights=w))
+                    return np.vstack(parts)
+            else:
+                jac = None
         else:
-            labels = at_labels
+            # Transformed scale path
+            def statistic(beta: np.ndarray) -> np.ndarray:
+                parts = []
+                for i, X in enumerate(Xs):
+                    w = weights_list[i]
+                    parts.append(
+                        np.atleast_1d(
+                            self._engine.weighted_mean(
+                                self._engine.predict_on_scale(beta, X, transform), weights=w
+                            )
+                        )
+                    )
+                return np.vstack(parts)
 
-        Xs = [profile.materialize(f, self) for f in frames]
-
-        def statistic(beta: np.ndarray) -> np.ndarray:
-            parts = []
-            for i, X in enumerate(Xs):
-                parts.append(np.atleast_1d(np.mean(self._predict(beta, X), axis=0)))
-            return np.vstack(parts)
-
-        fprime = self._link_deriv()
-        if fprime is not None or self._is_mnlogit():
             def jac(beta: np.ndarray) -> np.ndarray:
                 parts = []
                 for i, X in enumerate(Xs):
-                    parts.append(self._grad_mean_predict(X, beta, fprime))
+                    w = weights_list[i]
+                    parts.append(
+                        self._engine.grad_mean_predict_on_scale(X, beta, transform, weights=w)
+                    )
                 return np.vstack(parts)
-        else:
-            jac = None
 
         if vce == "bootstrap":
             def _margin_factory(results_b):
@@ -1415,7 +705,9 @@ class Margins:
                     at=at,
                     atexog=atexog,
                     factor_stat=factor_stat,
+                    scale=scale,
                     outcome=outcome,
+                    over=over,
                     vce="delta",
                 )
         else:
@@ -1456,7 +748,9 @@ class Margins:
             step: Optional[float] = None,
             reference: Optional[object] = None,
             factor_stat: Optional[str] = None,
+            over: Optional[Union[str, List[str]]] = None,
             method: str = "dydx",
+            scale: Union[str, Transform] = "response",
             outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
             vce: str = "delta",
             cov_type: Optional[str] = None,
@@ -1474,7 +768,7 @@ class Margins:
             ci_method: str = "pointwise",
             ci_alpha: float = 0.05,
         ) -> MarginsResult:
-        r"""Marginal effect of ``variable`` on the response.
+        r"""Marginal effect of ``variable`` on the chosen scale.
 
         Parameters
         ----------
@@ -1514,6 +808,9 @@ class Margins:
             is (auto- or explicitly) discrete and ``method != "dydx"``.
             Elasticity methods always go through finite differences;
             ``analytic=True`` on the constructor only affects ``"dydx"``.
+        scale : str or Transform, default "response"
+            Scale on which to report marginal effects. See :meth:`predict`
+            for built-in values.
         outcome : int, str, or sequence, optional
             For multi-outcome models, subset to the specified outcome
             class(es).
@@ -1642,10 +939,20 @@ class Margins:
             raise ValueError(
                 f"method must be one of {sorted(_METHOD_META)}, got {method!r}"
             )
-        self._check_at(at)
+        check_at(at)
         if factor_stat is None:
-            factor_stat = self._default_factor_stat(at)
-        self._check_factor_stat(factor_stat)
+            factor_stat = default_factor_stat(at)
+        check_factor_stat(factor_stat)
+
+        transform = self._engine.resolve_scale(scale)
+
+        # Custom-transform validation for dydx
+        if isinstance(scale, Transform) and transform is not None and transform.hess is None:
+            raise ValueError(
+                "Custom transforms used in dydx require an analytic second "
+                "derivative (hess=). Predicted-value calls (Margins.predict) "
+                "only need grad=."
+            )
 
         if variable == "*":
             # All columns minus the response. This may include columns not
@@ -1672,8 +979,11 @@ class Margins:
                         "If you intended a discrete change, set discrete=True."
                     )
 
-        profile = self._resolve_base(at, factor_stat)
-        frames, at_labels = self._expand_at(profile.frame, atexog)
+        profile, frames, at_labels, weights_list = self._design.expand_over(
+            at, factor_stat, atexog, over=over,
+            weights=self._engine.weights,
+            get_weights=self._engine.get_weights,
+        )
 
         if count:
             if discrete is True:
@@ -1699,8 +1009,9 @@ class Margins:
                         "the contrast x -> x+1 may not be physically meaningful.",
                         RuntimeWarning
                     )
-                res_parts = self._dydx_count_components(
-                    v, profile, frames, at_labels,
+                res_parts = self._derivs.count_components(
+                    v, profile, frames, at_labels, transform=transform,
+                    weights_list=weights_list,
                 )
                 parts.append(res_parts)
                 continue
@@ -1723,14 +1034,16 @@ class Margins:
                 )
 
             if v_discrete:
-                res_parts = self._dydx_discrete_components(
+                res_parts = self._derivs.discrete_components(
                     v, profile, frames, at_labels, reference=reference,
+                    transform=transform, weights_list=weights_list,
                 )
                 parts.append(res_parts)
             else:
-                res_parts = self._dydx_continuous_components(
+                res_parts = self._derivs.continuous_components(
                     v, profile, frames, at_labels, step=step, at=at,
-                    method=method,
+                    method=method, transform=transform,
+                    weights_list=weights_list,
                 )
                 parts.append(res_parts)
 
@@ -1788,7 +1101,9 @@ class Margins:
                     step=step,
                     reference=reference,
                     factor_stat=factor_stat,
+                    over=over,
                     method=method,
+                    scale=scale,
                     outcome=outcome,
                     vce="delta",
                 )
@@ -1817,285 +1132,8 @@ class Margins:
         )
 
     # ----- continuous case (numerical derivative) ---------------------------
-
-    @staticmethod
-    def _continuous_label_suffix(at: str) -> str:
-        """Human-readable suffix for an evaluation profile."""
-        return {"overall": "", "mean": " (at means)",
-                "median": " (at medians)", "zero": " (at zero)"}[at]
-
-    def _continuous_labels(
-        self, variable: str, method: str, at: str, at_labels: List[str],
-        n_frames: int,
-    ) -> List[str]:
-        """Build column labels for a continuous marginal effect.
-
-        Labels combine the method prefix (``d`` for ``dydx``/``dyex``,
-        ``e`` for ``eyex``/``eydx``), the variable name, the evaluation
-        profile suffix, and any ``atexog`` label.
-        """
-        prefix = _METHOD_META[method]["prefix"]
-        if n_frames == 1 and at_labels[0] == "":
-            return [f"{prefix}{variable}{self._continuous_label_suffix(at)}"]
-        return [f"{prefix}{variable} | {lab}" if lab else f"{prefix}{variable}"
-                for lab in at_labels]
-
-    def _dydx_continuous_components(
-        self,
-        variable: str,
-        profile: _Profile,
-        frames: List[pd.DataFrame],
-        at_labels: List[str],
-        step: Optional[float],
-        at: str,
-        method: str = "dydx",
-    ):
-        r"""Build statistic and Jacobian for a continuous derivative marginal effect.
-
-        Uses a central finite-difference step to approximate
-        :math:`\partial y / \partial x`.  For ``method="dydx"`` the paired
-        contrast machinery can be used with an analytic Jacobian; elasticity
-        branches (``dyex``, ``eyex``, ``eydx``) require per-row scaling and
-        fall back to finite differences for the outer Jacobian.
-
-        Parameters
-        ----------
-        variable : str
-            Column name of the continuous covariate.
-        profile : _Profile
-            Evaluation profile controlling numerics/design collapse.
-        frames : list of pd.DataFrame
-            Base frames (already expanded via ``_expand_at``).
-        at_labels : list of str
-            Labels for each ``atexog`` combination.
-        step : float, optional
-            Finite-difference step size. Defaults to
-            :math:`\epsilon^{1/3} \cdot \max(\text{sd}(x), |\bar x|, 1)`.
-        at : str
-            Profile name (``overall``, ``mean``, ``median``, ``zero``).
-        method : {"dydx", "dyex", "eyex", "eydx"}, default "dydx"
-            Transform applied to the raw derivative before averaging.
-
-        Returns
-        -------
-        tuple
-            ``(statistic, jac, labels, stat_name)`` suitable for ``_delta``.
-
-        Notes
-        -----
-        ``method="dydx"`` is the only path that admits an analytic outer
-        Jacobian (via ``_paired_contrast``).  Elasticity methods need
-        per-row :math:`x_i` and :math:`y_i` values, so the Jacobian is
-        always obtained by finite differences.
-        """
-        if step is None:
-            sd = float(self.data[variable].std(ddof=0))
-            scale = max(sd, abs(float(self.data[variable].mean())), 1.0)
-            step = (np.finfo(float).eps ** (1.0 / 3.0)) * scale
-        h = float(step)
-
-        labels = self._continuous_labels(variable, method, at, at_labels, len(frames))
-        stat_name = _METHOD_META[method]["stat_name"]
-
-        def perturb(fr: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-            x_col = np.asarray(fr[variable], dtype=float)
-            fp = fr.copy(); fp[variable] = x_col + h
-            fm = fr.copy(); fm[variable] = x_col - h
-            return fp, fm
-
-        if method == "dydx":
-            # Pure paired contrast scaled by 1/(2h) — analytic jac available.
-            pairs = self._design_pairs(profile, frames, perturb)
-            statistic, jac = self._paired_contrast(pairs, scale=1.0 / (2.0 * h))
-            return (statistic, jac, labels, stat_name)
-
-        # Elasticity branches need per-row x_i (and per-row y_i for eyex/eydx),
-        # so they don't fit the simple paired-mean schema. Build the same
-        # design pairs, but keep the original (unperturbed) design and the
-        # original x column around for the per-row scaling.
-        need_y = method in ("eyex", "eydx")
-        Xs_plus: List[np.ndarray] = []
-        Xs_minus: List[np.ndarray] = []
-        Xs_orig: List[np.ndarray] = []
-        x_vals: List[np.ndarray] = []
-        for fr in frames:
-            x_col = np.asarray(fr[variable], dtype=float)
-            fp, fm = perturb(fr)
-            Xs_plus.append(profile.materialize(fp, self))
-            Xs_minus.append(profile.materialize(fm, self))
-            if need_y:
-                Xs_orig.append(profile.materialize(fr, self))
-            if profile.collapse_design:
-                x_col = np.array([x_col.mean()])
-            x_vals.append(x_col)
-
-        def statistic(beta: np.ndarray) -> np.ndarray:
-            parts = []
-            for i in range(len(Xs_plus)):
-                dydx_i = (self._predict(beta, Xs_plus[i])
-                          - self._predict(beta, Xs_minus[i])) / (2.0 * h)
-                x_i = np.asarray(x_vals[i])
-                if x_i.ndim == 1:
-                    x_i = x_i[:, None]
-                if method == "dyex":
-                    contrib = dydx_i * x_i
-                else:  # eyex / eydx
-                    y_i = self._predict(beta, Xs_orig[i])
-                    if np.any(y_i < 1e-12):
-                        warnings.warn(
-                            "predicted probabilities below 1e-12 for some "
-                            "outcome classes; elasticities for those classes "
-                            "are unstable",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                    if method == "eyex":
-                        contrib = dydx_i * x_i / y_i
-                    else:  # eydx
-                        contrib = dydx_i / y_i
-                parts.append(np.atleast_1d(np.mean(contrib, axis=0)))
-            return np.vstack(parts)
-
-        # Analytic outer jac would require quotient-rule plumbing for the
-        # per-row 1/y_i; FD is fine.
-        return (statistic, None, labels, stat_name)
-
     # ----- count case (unit increment x -> x+1) ----------------------------
-
-    def _dydx_count_components(
-        self,
-        variable: str,
-        profile: _Profile,
-        frames: List[pd.DataFrame],
-        at_labels: List[str],
-    ):
-        r"""Build statistic and Jacobian for a count (unit increment) marginal effect.
-
-        Computes :math:`E[f(X \mid x+1)] - E[f(X \mid x)]` via paired
-        contrasts, treating ``variable`` as an integer-valued covariate.
-
-        Parameters
-        ----------
-        variable : str
-            Column name of the integer-valued covariate.
-        profile : _Profile
-            Evaluation profile controlling design collapse.
-        frames : list of pd.DataFrame
-            Base frames (already expanded via ``_expand_at``).
-        at_labels : list of str
-            Labels for each ``atexog`` combination.
-
-        Returns
-        -------
-        tuple
-            ``(statistic, jac, labels, stat_name)`` suitable for ``_delta``.
-
-        Notes
-        -----
-        When ``collapse_design`` is active, we also ``collapse_numerics`` so
-        derived columns like ``I(x**2)`` evaluate to ``mean(x)**2`` rather
-        than ``mean(x**2)``. The continuous-FD path does not need this
-        because its :math:`O(h^2)` truncation error vanishes; the unit
-        increment does not.
-        """
-        # Under ``collapse_design`` we also collapse_numerics, so that
-        # I(x**2)-style derived columns evaluate to mean(x)**2 rather than
-        # mean(x**2) — i.e. the contrast becomes f(η at mean+1) − f(η at
-        # mean), Stata-style. The continuous-FD path doesn't need this
-        # because its O(h²) residual vanishes; the unit increment doesn't.
-        profile = _Profile(
-            frame=profile.frame,
-            collapse_design=profile.collapse_design,
-            collapse_numerics=profile.collapse_design,
-        )
-
-        def perturb(fr: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-            fp = fr.copy(); fp[variable] = fp[variable] + 1
-            return fp, fr
-
-        pairs = self._design_pairs(profile, frames, perturb)
-        statistic, jac = self._paired_contrast(pairs)
-        base = f"{variable} (count)"
-        labels = [f"{base} | {lab}" if lab else base for lab in at_labels]
-        return (statistic, jac, labels, "dy/dx")
-
     # ----- discrete case (contrast vs reference level) ---------------------
-
-    def _dydx_discrete_components(
-        self,
-        variable: str,
-        profile: _Profile,
-        frames: List[pd.DataFrame],
-        at_labels: List[str],
-        reference: Optional[object],
-    ):
-        r"""Build statistic and Jacobian for discrete contrasts of a factor variable.
-
-        For each non-reference level, compute
-        :math:`E[f(X \mid \text{level})] - E[f(X \mid \text{reference})]`
-        via paired contrasts.
-
-        Parameters
-        ----------
-        variable : str
-            Factor column name in the data frame.
-        profile : _Profile
-            Evaluation profile controlling design collapse.
-        frames : list of pd.DataFrame
-            Base frames (already expanded via ``_expand_at``).
-        at_labels : list of str
-            Labels for each ``atexog`` combination.
-        reference : object, optional
-            Reference level to contrast against. Defaults to the smallest
-            observed level.
-
-        Returns
-        -------
-        tuple
-            ``(statistic, jac, labels, stat_name)`` suitable for ``_delta``.
-
-        Notes
-        -----
-        Enables ``collapse_numerics`` when ``collapse_design`` is active so
-        that derived columns (e.g. ``I(x**2)``) evaluate at the mean before
-        the level substitution, matching Stata semantics.
-        """
-        # See ``_dydx_count_components`` for why we collapse numerics here.
-        profile = _Profile(
-            frame=profile.frame,
-            collapse_design=profile.collapse_design,
-            collapse_numerics=profile.collapse_design,
-        )
-
-        levels = self.data[variable].dropna().unique().tolist()
-        try:
-            levels = sorted(levels)
-        except TypeError:
-            pass
-        if len(levels) < 2:
-            raise ValueError(f"variable {variable!r} has <2 unique levels")
-        if reference is None:
-            reference = levels[0]
-        others = [lv for lv in levels if lv != reference]
-
-        # One pair per (frame × non-reference level). Build manually rather
-        # than via ``_design_pairs``'s single-perturb callable. ``materialize``
-        # is safe here because ``variable`` is the discrete level being set;
-        # numerics-collapse runs first and doesn't touch it.
-        pairs: List[tuple[np.ndarray, np.ndarray]] = []
-        labels: List[str] = []
-        for frame, at_lab in zip(frames, at_labels):
-            f_ref = frame.copy(); f_ref[variable] = reference
-            Xref = profile.materialize(f_ref, self)
-            for lvl in others:
-                f_lvl = frame.copy(); f_lvl[variable] = lvl
-                pairs.append((profile.materialize(f_lvl, self), Xref))
-                base = f"{variable}: {lvl} vs {reference}"
-                labels.append(f"{base} | {at_lab}" if at_lab else base)
-
-        statistic, jac = self._paired_contrast(pairs)
-        return (statistic, jac, labels, "contrast")
-
     # ======================================================================}
     # Public API: difference-in-differences
     # ======================================================================}
@@ -2109,6 +1147,7 @@ class Margins:
         at: str = "overall",
         atexog: Optional[Mapping[str, object]] = None,
         factor_stat: Optional[str] = None,
+        scale: Union[str, Transform] = "response",
         vce: str = "delta",
         cov_type: Optional[str] = None,
         vcov: Optional[np.ndarray] = None,
@@ -2116,7 +1155,7 @@ class Margins:
         ci_method: str = "pointwise",
         ci_alpha: float = 0.05,
     ) -> "DiDResult":
-        r"""Difference-in-differences on the response scale.
+        r"""Difference-in-differences on the chosen scale.
 
         Sets up a 2×2 grid (``group`` × ``condition``), computes adjusted
         predictions for all four cells (averaging over other covariates
@@ -2129,11 +1168,13 @@ class Margins:
         group, condition : str
             Names of the two binary-ish factors. The "DiD" is the
             difference in the group-effect between the two condition
-            levels, on the response scale.
+            levels, on the chosen scale.
         group_levels, condition_levels : sequence of length 2, optional
             Which two levels to use (reference first, treated second).
             Default: the two smallest observed levels.
         at, atexog, factor_stat : see :meth:`predict`.
+        scale : str or Transform, default "response"
+            Scale on which to report predictions. See :meth:`predict`.
         vce : {"delta"}, default "delta"
             Only delta-method VCE is supported for DiD in this release.
         cov_type : str, optional
@@ -2257,6 +1298,7 @@ class Margins:
         atexog_full[condition] = c
         cells = self.predict(
             at=at, atexog=atexog_full, factor_stat=factor_stat,
+            scale=scale,
             vce=vce, cov_type=cov_type, vcov=vcov, cov_kwds=cov_kwds,
             ci_method=ci_method, ci_alpha=ci_alpha,
         )
@@ -2380,5 +1422,4 @@ class Margins:
             # Take smallest and largest, to be explicit
             vals = [vals[0], vals[-1]]
         return vals
-
 

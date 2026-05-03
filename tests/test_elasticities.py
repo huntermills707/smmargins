@@ -7,7 +7,10 @@ variables and unknown method names.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
+import statsmodels.formula.api as smf
+from statsmodels.genmod.families import Poisson
 from numpy.testing import assert_allclose
 
 from smmargins import Margins
@@ -62,6 +65,88 @@ def test_poisson_mem_eyex_hand_check(poisson_fit, sim_frame):
     mem_eyex = MP.dydx("x1", at="mean", method="eyex")
     hand = poisson_fit.params["x1"] * sim_frame["x1"].mean()
     assert_allclose(mem_eyex.estimate[0], hand, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Elasticity × scale composition
+# ---------------------------------------------------------------------------
+
+def test_logit_eyex_scale_response_explicit(logit_fit):
+    """Explicit scale='response' should match default."""
+    ML = Margins(logit_fit)
+    default = ML.dydx("x1", method="eyex")
+    explicit = ML.dydx("x1", method="eyex", scale="response")
+    assert_allclose(default.estimate, explicit.estimate, atol=1e-10)
+    assert_allclose(default.se, explicit.se, rtol=1e-6)
+
+
+def test_logit_eyex_scale_linear_hand_derived():
+    """eyex on linear scale: hand-derived check.
+
+    For logit with scale='linear':
+        y = η = Xβ
+        eyex = (∂y/∂x) * (x/y) = β * x / η
+        AME eyex = mean(β * x / η) = β * mean(x/η)
+    """
+    rng = np.random.default_rng(0)
+    n = 200
+    df = pd.DataFrame({
+        "x1": rng.standard_normal(n),
+        "x2": rng.standard_normal(n),
+    })
+    df["y"] = (0.5 + 1.0 * df["x1"] - 0.5 * df["x2"] + 0.5 * rng.standard_normal(n)) > 0
+    df["y"] = df["y"].astype(int)
+    fit = smf.logit("y ~ x1 + x2", df).fit(disp=0)
+    M = Margins(fit)
+    res = M.dydx("x1", method="eyex", scale="linear")
+
+    beta1 = fit.params["x1"]
+    eta = fit.model.exog @ fit.params.values
+    expected = beta1 * np.mean(df["x1"] / eta)
+    assert_allclose(res.estimate[0], expected, atol=1e-6)
+
+
+def test_poisson_eyex_scale_response_canonical():
+    """eyex on Poisson with scale='response' equals β_k * x̄_k exactly."""
+    rng = np.random.default_rng(0)
+    n = 200
+    df = pd.DataFrame({"x1": rng.standard_normal(n), "x2": rng.standard_normal(n)})
+    df["y"] = rng.poisson(np.exp(1.0 + 0.5 * df["x1"] - 0.3 * df["x2"]))
+    fit = smf.glm("y ~ x1 + x2", df, family=Poisson()).fit()
+    M = Margins(fit)
+    res = M.dydx("x1", method="eyex", scale="response")
+
+    expected = fit.params["x1"] * df["x1"].mean()
+    assert_allclose(res.estimate[0], expected, atol=1e-10)
+
+
+def test_eyex_quadratic_transform_hand_check():
+    """Elasticity × custom quadratic transform on small OLS fixture.
+
+    For g(η)=η²:
+        ∂g/∂x = 2ηβ
+        eyex = (∂g/∂x) * (x/g) = 2ηβ * x / η² = 2βx / η
+        AME eyex = mean(2βx / η)
+    """
+    rng = np.random.default_rng(42)
+    df = pd.DataFrame({"x": [0.0, 1.0, 2.0]})
+    df["y"] = 1.0 + 2.0 * df["x"] + 0.05 * rng.standard_normal(3)
+    fit = smf.ols("y ~ x", df).fit()
+    M = Margins(fit)
+
+    from smmargins.transforms import Transform
+    t = Transform(
+        value=lambda eta: eta ** 2,
+        grad=lambda eta: 2 * eta,
+        hess=lambda eta: np.full_like(eta, 2.0),
+        name="quad",
+    )
+    res = M.dydx("x", method="eyex", scale=t)
+
+    beta = fit.params["x"]
+    eta = fit.model.exog @ fit.params.values
+    expected = np.mean(2 * beta * df["x"] / eta)
+    assert_allclose(res.estimate[0], expected, atol=1e-8)
 
 
 # ---------------------------------------------------------------------------

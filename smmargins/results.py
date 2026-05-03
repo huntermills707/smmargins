@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -136,6 +139,7 @@ class MarginsResult:
         c: Union[Sequence[float], np.ndarray],
         labels: Optional[Sequence[str]] = None,
         name: str = "contrast",
+        ci_method: Optional[str] = None,
     ) -> "MarginsResult":
         """Compute linear contrasts of the estimates.
 
@@ -179,7 +183,7 @@ class MarginsResult:
         return MarginsResult(
             estimate=est, vcov=vcov, labels=labels,
             level=self.level, df=self.df, stat_name=name,
-            ci_method=self.ci_method,
+            ci_method=ci_method if ci_method is not None else self.ci_method,
             draws=draws,
         )
 
@@ -231,6 +235,138 @@ class MarginsResult:
             draws=draws,
         )
 
+    def wald(
+        self,
+        C: Optional[Union[Sequence[float], np.ndarray]] = None,
+        value: Union[float, Sequence[float]] = 0.0,
+    ) -> "WaldResult":
+        r"""Joint Wald test of linear restrictions on the margins.
+
+        Computes :math:`\chi^2 = (C\hat\theta - c_0)' (C V C')^{-1}
+        (C\hat\theta - c_0)` with degrees of freedom equal to the rank
+        of the contrast covariance.
+
+        Parameters
+        ----------
+        C : array-like, optional
+            Contrast matrix of shape ``(m, k)`` where ``k`` is the number
+            of margins. If ``None``, tests that *all* margins equal
+            ``value`` (i.e. ``C = eye(k)``).
+        value : float or array-like, default 0
+            Hypothesized value under the null.
+
+        Returns
+        -------
+        WaldResult
+
+        Raises
+        ------
+        ValueError
+            If the contrast covariance is singular.
+        """
+        if C is None:
+            C = np.eye(len(self.estimate))
+        C_arr = np.asarray(C, dtype=float)
+        if C_arr.ndim == 1:
+            C_arr = C_arr.reshape(1, -1)
+        if C_arr.shape[1] != self.estimate.size:
+            raise ValueError(
+                f"contrast has {C_arr.shape[1]} columns, but there are "
+                f"{self.estimate.size} estimates"
+            )
+
+        val = np.atleast_1d(np.asarray(value, dtype=float))
+        if val.size == 1:
+            val = np.full(C_arr.shape[0], val.item())
+        elif val.size != C_arr.shape[0]:
+            raise ValueError(
+                "value length must match number of contrasts "
+                f"({C_arr.shape[0]})"
+            )
+
+        theta = C_arr @ self.estimate - val
+        V_theta = C_arr @ self.vcov @ C_arr.T
+
+        # Test for singularity using a small tolerance
+        try:
+            V_inv = np.linalg.inv(V_theta)
+        except np.linalg.LinAlgError:
+            raise ValueError(
+                "The contrast covariance matrix is singular. "
+                "Use a smaller subset of contrasts or check for "
+                "redundant rows in C."
+            )
+
+        stat = float(theta @ V_inv @ theta)
+        df = int(np.linalg.matrix_rank(V_theta))
+        pvalue = float(1 - stats.chi2.cdf(stat, df))
+
+        return WaldResult(
+            stat=stat,
+            df=df,
+            pvalue=pvalue,
+            contrast_matrix=C_arr,
+            contrast_estimates=theta,
+        )
+
+    def pairwise(self, by: str, ci_method: Optional[str] = None) -> "MarginsResult":
+        """All pairwise comparisons of a factor variable's levels.
+
+        Parameters
+        ----------
+        by : str
+            The factor variable name. The current result must contain
+            discrete contrasts for this variable (e.g. from ``dydx(by)``).
+
+        Returns
+        -------
+        MarginsResult
+            One row per pairwise comparison.
+
+        Raises
+        ------
+        ValueError
+            If fewer than 2 rows are found for ``by``.
+        """
+        prefix = f"{by}:"
+        indices: List[int] = []
+        levels: List[str] = []
+        references: List[str] = []
+        for i, lab in enumerate(self.labels):
+            # Strip any outcome suffix for matching
+            base = lab.split(" (")[0]
+            if base.startswith(prefix):
+                indices.append(i)
+                # Parse "by: lvl vs ref"
+                rest = base[len(prefix):].strip()
+                match = re.match(r"(.+?)\s+vs\s+(.+)", rest)
+                if match:
+                    levels.append(match.group(1).strip())
+                    references.append(match.group(2).strip())
+                else:
+                    levels.append(rest)
+                    references.append("")
+
+        if len(indices) < 2:
+            raise ValueError(
+                f"Need at least 2 contrasts for {by!r} to build pairwise "
+                f"comparisons. Found {len(indices)} matching rows."
+            )
+
+        n = len(indices)
+        C_rows: List[np.ndarray] = []
+        new_labels: List[str] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                c = np.zeros(len(self.estimate))
+                c[indices[i]] = 1.0
+                c[indices[j]] = -1.0
+                C_rows.append(c)
+                new_labels.append(f"{by}: {levels[i]} vs {levels[j]}")
+
+        C = np.vstack(C_rows)
+        return self.contrast(C, labels=new_labels, name="pairwise", ci_method=ci_method)
+
     def summary(self) -> pd.DataFrame:
         """A summary table of the results."""
         df = pd.DataFrame({
@@ -245,6 +381,37 @@ class MarginsResult:
 
     def __repr__(self) -> str:
         return self.summary().to_string()
+
+
+@dataclass
+class WaldResult:
+    """Result of a joint Wald test.
+
+    Attributes
+    ----------
+    stat : float
+        Wald chi-squared statistic.
+    df : int
+        Degrees of freedom (rank of the contrast covariance).
+    pvalue : float
+        Two-sided p-value from the chi-squared distribution.
+    contrast_matrix : ndarray
+        The contrast matrix C used in the test.
+    contrast_estimates : ndarray
+        The contrasted estimates C @ theta_hat - value.
+    """
+
+    stat: float
+    df: int
+    pvalue: float
+    contrast_matrix: np.ndarray
+    contrast_estimates: np.ndarray
+
+    def __repr__(self) -> str:
+        return (
+            f"WaldResult(stat={self.stat:.4f}, df={self.df}, "
+            f"pvalue={self.pvalue:.4g})"
+        )
 
 
 class DiDResult:

@@ -15,4 +15,12 @@ API reference
     Margins
     MarginsResult
     DiDResult
+    WaldResult
+    Transform
+    transforms.Identity
+    transforms.Linear
+    transforms.Exp
+    transforms.Log
+    transforms.Logit
+    transforms.Probit
     utils._central_jacobian
