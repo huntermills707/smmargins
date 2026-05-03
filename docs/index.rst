@@ -12,22 +12,39 @@ fitted model that exposes ``params``, ``cov_params()``, and
 
 .. toctree::
     :maxdepth: 2
-    :caption: User guide
+    :caption: Getting started
 
     intro
-    math
-    demos
+
+.. toctree::
+    :maxdepth: 1
+    :caption: Tutorials (executable notebooks)
+
+    tutorials/plotting
+
+.. toctree::
+    :maxdepth: 1
+    :caption: How-to recipes
+
     cookbook_values
     cookbook_transforms
     cookbook_newdata
     cookbook_contrast
     cookbook_plotting
+    demos
 
 .. toctree::
     :maxdepth: 2
     :caption: Reference
 
     api
+
+.. toctree::
+    :maxdepth: 1
+    :caption: Explanations (theory & design)
+
+    math
+    explanations/contrast_joint_covariance
 
 Indices
 -------
