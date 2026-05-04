@@ -298,9 +298,7 @@ Both terms appear: the first comes from differentiating
 from differentiating the explicit :math:`\beta_k`. ``smmargins``
 computes this Jacobian analytically when ``Transform.hess`` is
 provided (every built-in does). Without ``hess``, ``dydx`` raises —
-this is the package's strict-derivative contract. A module-level
-``_DYDX_FD_ONLY`` flag (in :mod:`smmargins._derivs`) forces a
-finite-difference fallback for testing parity.
+this is the package's strict-derivative contract.
 
 **Discrete contrasts** under a g-scale are simpler: the contrast is
 :math:`g(\eta_a) - g(\eta_b)` averaged over the sample, and its

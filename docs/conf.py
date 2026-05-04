@@ -62,6 +62,7 @@ exclude_patterns = [
     '**/jupyter_execute',
     'tutorials/README.md',
     'explanations/README.md',
+    '**/README.md',
 ]
 
 html_theme = 'alabaster'
