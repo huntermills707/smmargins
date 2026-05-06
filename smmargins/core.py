@@ -525,6 +525,9 @@ class Margins:
             n_jobs: int = 1,
             ci_method: str = "pointwise",
             ci_alpha: float = 0.05,
+            values: Optional[Mapping[str, Any]] = None,
+            default_values: str = "asobserved",
+            newdata: Optional[pd.DataFrame] = None,
         ) -> MarginsResult:
         r"""Compute adjusted predictions.
 
@@ -629,14 +632,28 @@ class Margins:
 
         transform = self._engine.resolve_scale(scale)
 
-        profile, frames, labels, weights_list = self._design.expand_over(
-            at, factor_stat, atexog, over=over,
-            weights=self._engine.weights,
-            get_weights=self._engine.get_weights,
-        )
+        if newdata is not None:
+            if at != "overall" or atexog is not None or values is not None or over is not None:
+                raise ValueError(
+                    "newdata= is mutually exclusive with at/atexog/values/over. "
+                    "Pass an arbitrary frame OR use the at/atexog/values DSL, not both."
+                )
+            self._design.validate_newdata(newdata)
+            profile = _Profile(frame=newdata, collapse_design=False)
+            frames = [newdata]
+            labels = ["newdata"]
+            weights_list = [None]
+        else:
+            profile, frames, labels, weights_list = self._design.expand_over(
+                at, factor_stat, atexog, over=over,
+                weights=self._engine.weights,
+                get_weights=self._engine.get_weights,
+                values=values,
+                default_values=default_values,
+            )
 
         stat_name = "prediction"
-        if over is None and atexog is None:
+        if over is None and atexog is None and values is None and newdata is None:
             if at == "overall":
                 labels = ["AAP"]
             elif at == "mean":
@@ -708,6 +725,8 @@ class Margins:
                     scale=scale,
                     outcome=outcome,
                     over=over,
+                    values=values,
+                    default_values=default_values,
                     vce="delta",
                 )
         else:
@@ -767,6 +786,9 @@ class Margins:
             n_jobs: int = 1,
             ci_method: str = "pointwise",
             ci_alpha: float = 0.05,
+            values: Optional[Mapping[str, Any]] = None,
+            default_values: str = "asobserved",
+            newdata: Optional[pd.DataFrame] = None,
         ) -> MarginsResult:
         r"""Marginal effect of ``variable`` on the chosen scale.
 
@@ -979,11 +1001,25 @@ class Margins:
                         "If you intended a discrete change, set discrete=True."
                     )
 
-        profile, frames, at_labels, weights_list = self._design.expand_over(
-            at, factor_stat, atexog, over=over,
-            weights=self._engine.weights,
-            get_weights=self._engine.get_weights,
-        )
+        if newdata is not None:
+            if at != "overall" or atexog is not None or values is not None or over is not None:
+                raise ValueError(
+                    "newdata= is mutually exclusive with at/atexog/values/over. "
+                    "Pass an arbitrary frame OR use the at/atexog/values DSL, not both."
+                )
+            self._design.validate_newdata(newdata)
+            profile = _Profile(frame=newdata, collapse_design=False)
+            frames = [newdata]
+            at_labels = ["newdata"]
+            weights_list = [None]
+        else:
+            profile, frames, at_labels, weights_list = self._design.expand_over(
+                at, factor_stat, atexog, over=over,
+                weights=self._engine.weights,
+                get_weights=self._engine.get_weights,
+                values=values,
+                default_values=default_values,
+            )
 
         if count:
             if discrete is True:
@@ -1105,6 +1141,8 @@ class Margins:
                     method=method,
                     scale=scale,
                     outcome=outcome,
+                    values=values,
+                    default_values=default_values,
                     vce="delta",
                 )
         else:
@@ -1154,6 +1192,8 @@ class Margins:
         cov_kwds: Optional[dict] = None,
         ci_method: str = "pointwise",
         ci_alpha: float = 0.05,
+        values: Optional[Mapping[str, Any]] = None,
+        default_values: str = "asobserved",
     ) -> "DiDResult":
         r"""Difference-in-differences on the chosen scale.
 
@@ -1301,6 +1341,8 @@ class Margins:
             scale=scale,
             vce=vce, cov_type=cov_type, vcov=vcov, cov_kwds=cov_kwds,
             ci_method=ci_method, ci_alpha=ci_alpha,
+            values=values,
+            default_values=default_values,
         )
 
         K = self.n_outcomes
@@ -1392,6 +1434,246 @@ class Margins:
         )
         return DiDResult(cells=cells, simple_effects=simple, did=did_,
                          joint=joint)
+
+    def contrast(
+        self,
+        a: Optional[Mapping[str, Any]] = None,
+        b: Optional[Mapping[str, Any]] = None,
+        a_newdata: Optional[pd.DataFrame] = None,
+        b_newdata: Optional[pd.DataFrame] = None,
+        at: str = "overall",
+        default_values: str = "asobserved",
+        over: Optional[Union[str, List[str]]] = None,
+        scale: Union[str, Transform] = "response",
+        outcome: Optional[Union[int, str, Sequence[Union[int, str]]]] = None,
+        vce: str = "delta",
+        cov_type: Optional[str] = None,
+        vcov: Optional[np.ndarray] = None,
+        cov_kwds: Optional[dict] = None,
+        n_sims: int = 2000,
+        sim_seed: Optional[int] = None,
+        n_boot: int = 1000,
+        boot_seed: Optional[int] = None,
+        boot_method: str = "pairs",
+        cluster: Optional[np.ndarray] = None,
+        block_size: Optional[int] = None,
+        verbose: bool = False,
+        n_jobs: int = 1,
+        ci_method: str = "pointwise",
+        ci_alpha: float = 0.05,
+    ) -> MarginsResult:
+        r"""Joint contrast between two counterfactual specifications.
+
+        Computes :math:`g_A(\beta)`, :math:`g_B(\beta)`, and
+        :math:`g_A(\beta) - g_B(\beta)` with the full joint covariance,
+        so the contrast SE is correct (including the off-diagonal term
+        between A and B).
+
+        Parameters
+        ----------
+        a, b : mapping, optional
+            ``values=``-style specification for arm A and arm B.
+            Mutually exclusive with ``a_newdata`` / ``b_newdata``.
+        a_newdata, b_newdata : DataFrame, optional
+            Escape-hatch frames for arm A and arm B.
+            Mutually exclusive with ``a`` / ``b``.
+        at, default_values, over : see :meth:`predict`.
+        scale, outcome : see :meth:`predict`.
+        vce, cov_type, vcov, cov_kwds, ci_method, ci_alpha : inference kwargs.
+
+        Returns
+        -------
+        MarginsResult
+            Three rows (or 3 blocks for multi-outcome): A, B, A-B.
+        """
+        # Validate arm specs
+        if a_newdata is not None and a is not None:
+            raise ValueError("Pass either a= or a_newdata=, not both")
+        if b_newdata is not None and b is not None:
+            raise ValueError("Pass either b= or b_newdata=, not both")
+        if a is None and a_newdata is None:
+            raise ValueError("Must provide a= or a_newdata=")
+        if b is None and b_newdata is None:
+            raise ValueError("Must provide b= or b_newdata=")
+
+        # Resolve arm A
+        if a_newdata is not None:
+            self._design.validate_newdata(a_newdata)
+            prof_a = _Profile(frame=a_newdata, collapse_design=False)
+            frames_a = [a_newdata]
+            labels_a = ["A"]
+            weights_a = [None]
+        else:
+            prof_a, frames_a, labels_a, weights_a = self._design.expand_over(
+                at, default_factor_stat(at), None, over=over,
+                weights=self._engine.weights,
+                get_weights=self._engine.get_weights,
+                values=a,
+                default_values=default_values,
+            )
+
+        # Resolve arm B
+        if b_newdata is not None:
+            self._design.validate_newdata(b_newdata)
+            prof_b = _Profile(frame=b_newdata, collapse_design=False)
+            frames_b = [b_newdata]
+            labels_b = ["B"]
+            weights_b = [None]
+        else:
+            prof_b, frames_b, labels_b, weights_b = self._design.expand_over(
+                at, default_factor_stat(at), None, over=over,
+                weights=self._engine.weights,
+                get_weights=self._engine.get_weights,
+                values=b,
+                default_values=default_values,
+            )
+
+        # Materialize design matrices
+        Xs_a = [prof_a.materialize(f, self._design) for f in frames_a]
+        Xs_b = [prof_b.materialize(f, self._design) for f in frames_b]
+
+        transform = self._engine.resolve_scale(scale)
+
+        # Build stacked statistic [g_A, g_B, g_A - g_B]
+        if transform is None:
+            def _stacked_stat(beta: np.ndarray) -> np.ndarray:
+                parts_a = []
+                for i, X in enumerate(Xs_a):
+                    w = weights_a[i]
+                    parts_a.append(
+                        np.atleast_1d(
+                            self._engine.weighted_mean(
+                                self._engine.predict(beta, X), weights=w
+                            )
+                        )
+                    )
+                parts_b = []
+                for i, X in enumerate(Xs_b):
+                    w = weights_b[i]
+                    parts_b.append(
+                        np.atleast_1d(
+                            self._engine.weighted_mean(
+                                self._engine.predict(beta, X), weights=w
+                            )
+                        )
+                    )
+                parts_a_2d = [p.reshape(1, -1) for p in parts_a]
+                parts_b_2d = [p.reshape(1, -1) for p in parts_b]
+                g_a = np.vstack(parts_a_2d)
+                g_b = np.vstack(parts_b_2d)
+                g_diff = g_a - g_b
+                return np.vstack([g_a, g_b, g_diff])
+
+            fprime = self._engine.link_deriv()
+            if fprime is not None or self._engine._is_mnlogit():
+                def _stacked_jac(beta: np.ndarray) -> np.ndarray:
+                    parts_a = []
+                    for i, X in enumerate(Xs_a):
+                        w = weights_a[i]
+                        parts_a.append(self._engine.grad_mean_predict(X, beta, fprime, weights=w))
+                    parts_b = []
+                    for i, X in enumerate(Xs_b):
+                        w = weights_b[i]
+                        parts_b.append(self._engine.grad_mean_predict(X, beta, fprime, weights=w))
+                    J_a = np.vstack(parts_a)
+                    J_b = np.vstack(parts_b)
+                    J_diff = J_a - J_b
+                    return np.vstack([J_a, J_b, J_diff])
+            else:
+                _stacked_jac = None
+        else:
+            def _stacked_stat(beta: np.ndarray) -> np.ndarray:
+                parts_a = []
+                for i, X in enumerate(Xs_a):
+                    w = weights_a[i]
+                    parts_a.append(
+                        np.atleast_1d(
+                            self._engine.weighted_mean(
+                                self._engine.predict_on_scale(beta, X, transform), weights=w
+                            )
+                        )
+                    )
+                parts_b = []
+                for i, X in enumerate(Xs_b):
+                    w = weights_b[i]
+                    parts_b.append(
+                        np.atleast_1d(
+                            self._engine.weighted_mean(
+                                self._engine.predict_on_scale(beta, X, transform), weights=w
+                            )
+                        )
+                    )
+                parts_a_2d = [p.reshape(1, -1) for p in parts_a]
+                parts_b_2d = [p.reshape(1, -1) for p in parts_b]
+                g_a = np.vstack(parts_a_2d)
+                g_b = np.vstack(parts_b_2d)
+                g_diff = g_a - g_b
+                return np.vstack([g_a, g_b, g_diff])
+
+            def _stacked_jac(beta: np.ndarray) -> np.ndarray:
+                parts_a = []
+                for i, X in enumerate(Xs_a):
+                    w = weights_a[i]
+                    parts_a.append(
+                        self._engine.grad_mean_predict_on_scale(X, beta, transform, weights=w)
+                    )
+                parts_b = []
+                for i, X in enumerate(Xs_b):
+                    w = weights_b[i]
+                    parts_b.append(
+                        self._engine.grad_mean_predict_on_scale(X, beta, transform, weights=w)
+                    )
+                J_a = np.vstack(parts_a)
+                J_b = np.vstack(parts_b)
+                J_diff = J_a - J_b
+                return np.vstack([J_a, J_b, J_diff])
+
+        # Labels
+        if len(labels_a) != len(labels_b):
+            raise ValueError(
+                f"Arms A and B must have the same number of rows for subtraction, "
+                f"got {len(labels_a)} vs {len(labels_b)}"
+            )
+        all_labels = [f"A: {lab}" for lab in labels_a] + [f"B: {lab}" for lab in labels_b] + [f"A - B: {lab}" for lab in labels_a]
+
+        if vce == "bootstrap":
+            def _margin_factory(results_b):
+                M = Margins(
+                    results_b,
+                    level=self.level,
+                    use_t=self.df is not None,
+                    analytic=self.analytic,
+                )
+                return M.contrast(
+                    a=a, b=b,
+                    a_newdata=a_newdata, b_newdata=b_newdata,
+                    at=at, default_values=default_values, over=over,
+                    scale=scale, outcome=outcome,
+                    vce="delta",
+                )
+        else:
+            _margin_factory = None
+
+        return self._delta(
+            _stacked_stat, labels=all_labels, stat_name="contrast", jac=_stacked_jac,
+            outcome=outcome,
+            vce=vce,
+            cov_type=cov_type,
+            vcov=vcov,
+            cov_kwds=cov_kwds,
+            n_sims=n_sims,
+            sim_seed=sim_seed,
+            n_boot=n_boot,
+            boot_seed=boot_seed,
+            boot_method=boot_method,
+            cluster=cluster,
+            block_size=block_size,
+            verbose=verbose,
+            n_jobs=n_jobs,
+            ci_method=ci_method,
+            ci_alpha=ci_alpha,
+            _margin_factory=_margin_factory,
+        )
 
     def _default_two_levels(self, col: str) -> list:
         """Return the two most extreme unique levels of a column.

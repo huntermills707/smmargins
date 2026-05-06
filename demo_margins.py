@@ -368,3 +368,38 @@ res_educ = M.dydx("educ")
 print()
 print("Pairwise comparisons across educ levels (Bonferroni-adjusted CIs):")
 print(res_educ.pairwise(by="educ", ci_method="bonferroni").summary())
+
+# ---------------------------------------------------------------------------
+# 19. Per-variable DSL (values=)
+#     Fix specific variables without restating every column.
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("19. Per-variable DSL — values= and default_values=")
+print("=" * 80)
+print("Predictions at income=p25/p50/p75, everything else at mean:")
+print(M.predict(values={"income": ["p25", "p50", "p75"]}, default_values="mean"))
+
+print()
+print("Counterfactual: income + 10% via Expr:")
+from smmargins import Expr
+print(M.predict(values={"income": Expr("income * 1.10")}))
+
+# ---------------------------------------------------------------------------
+# 20. Plotting
+# ---------------------------------------------------------------------------
+print()
+print("=" * 80)
+print("20. Plotting — prediction curve vs age")
+print("=" * 80)
+from smmargins import plot_predictions
+fig, ax = plot_predictions(M, "age")
+fig.savefig("demo_plot_predictions.png", dpi=150)
+print("Saved demo_plot_predictions.png")
+
+print()
+print("Plotting — AME of age vs income, by sex:")
+from smmargins import plot_slopes
+fig2, ax2 = plot_slopes(M, "age", condition="income", by="female")
+fig2.savefig("demo_plot_slopes.png", dpi=150)
+print("Saved demo_plot_slopes.png")

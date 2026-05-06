@@ -3,10 +3,30 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ._design import DesignResolver
+
+
+@dataclass(frozen=True)
+class Expr:
+    """String expression wrapper for use in ``values=``.
+
+    Strings in ``values=`` are interpreted as reducer names (e.g.
+    ``"mean"``, ``"p25"``). To evaluate a pandas expression via
+    ``df.eval``, wrap it in ``Expr(...)``.
+
+    Example
+    -------
+    >>> from smmargins import Expr
+    >>> M.predict(values={"income": Expr("income * 1.10")})
+    """
+    expr: str
+
+    def evaluate(self, frame: pd.DataFrame) -> pd.Series:
+        return frame.eval(self.expr)
+
 
 @dataclass
 class _Profile:

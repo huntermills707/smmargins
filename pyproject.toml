@@ -7,13 +7,13 @@ packages = ["smmargins"]
 
 [project]
 name = "smmargins"
-version = "0.4.0"
+version = "0.5.0"
 description = "Marginal effects for StatsModels"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Hunter Mills", email = "hunter.mills@pm.me" }]
 requires-python = ">=3.9"
-dependencies = ["numpy", "pandas", "statsmodels", "scipy", "patsy"]
+dependencies = ["numpy", "pandas", "statsmodels", "scipy", "patsy", "matplotlib>=3.5"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: BSD License",

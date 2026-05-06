@@ -184,3 +184,85 @@ def test_logit_at_matches_r(df_seed42):
         idx = np.where(mask)[0][0]
         assert_allclose(ame.estimate[idx], row["estimate"], atol=1e-5)
         assert_allclose(ame.se[idx], row["std.error"], atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# 0.5 parity: values=, newdata=, contrast
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(
+    not (HERE / "r_values_p25.csv").exists(),
+    reason="R reference output not found",
+)
+def test_values_p25_matches_r(df_seed12345):
+    """values={"x1": "p25"} matches marginaleffects::avg_predictions."""
+    fit = smf.ols("y_ols ~ x1 + x2 + dummy", data=df_seed12345).fit()
+    M = Margins(fit)
+    res = M.predict(values={"x1": "p25"})
+
+    ref = _read_r_csv(HERE / "r_values_p25.csv")
+    assert_allclose(res.estimate[0], ref["estimate"].iloc[0], atol=1e-8)
+    assert_allclose(res.se[0], ref["std.error"].iloc[0], atol=1e-6)
+
+
+@pytest.mark.skipif(
+    not (HERE / "r_values_grid.csv").exists(),
+    reason="R reference output not found",
+)
+def test_values_grid_matches_r(df_seed12345):
+    """values={"x1": [-1, 0, 1]} matches avg_predictions(variables=list(...))."""
+    fit = smf.ols("y_ols ~ x1 + x2 + dummy", data=df_seed12345).fit()
+    M = Margins(fit)
+    res = M.predict(values={"x1": [-1, 0, 1]})
+
+    ref = _read_r_csv(HERE / "r_values_grid.csv").sort_values("x1").reset_index(drop=True)
+    for i, row in ref.iterrows():
+        assert_allclose(res.estimate[i], row["estimate"], atol=1e-8)
+        assert_allclose(res.se[i], row["std.error"], atol=1e-6)
+
+
+@pytest.mark.skipif(
+    not (HERE / "r_newdata.csv").exists(),
+    reason="R reference output not found",
+)
+def test_newdata_matches_r(df_seed12345):
+    """newdata= matches avg_predictions(newdata=df_holdout)."""
+    fit = smf.ols("y_ols ~ x1 + x2 + dummy", data=df_seed12345).fit()
+    M = Margins(fit)
+    holdout = df_seed12345.tail(20).reset_index(drop=True)
+    res = M.predict(newdata=holdout)
+
+    ref = _read_r_csv(HERE / "r_newdata.csv")
+    assert_allclose(res.estimate[0], ref["estimate"].iloc[0], atol=1e-8)
+    assert_allclose(res.se[0], ref["std.error"].iloc[0], atol=1e-6)
+
+
+@pytest.mark.skipif(
+    not (HERE / "r_contrast_dummy.csv").exists(),
+    reason="R reference output not found",
+)
+def test_contrast_matches_r(df_seed12345):
+    """Margins.contrast diff row matches avg_comparisons (joint SE)."""
+    fit = smf.ols("y_ols ~ x1 + x2 + dummy", data=df_seed12345).fit()
+    M = Margins(fit)
+    joint = M.contrast(a={"dummy": 1}, b={"dummy": 0})
+
+    ref = _read_r_csv(HERE / "r_contrast_dummy.csv")
+    # The diff row is labeled "A - B: ...".
+    diff_idx = next(i for i, lab in enumerate(joint.labels) if lab.startswith("A - B:"))
+    assert_allclose(joint.estimate[diff_idx], ref["estimate"].iloc[0], atol=1e-8)
+    assert_allclose(joint.se[diff_idx], ref["std.error"].iloc[0], atol=1e-6)
+
+
+@pytest.mark.skipif(
+    not (HERE / "r_dydx_at_p25.csv").exists(),
+    reason="R reference output not found",
+)
+def test_dydx_with_values_matches_r(df_seed12345):
+    """dydx('x1', values={'x2': 'p25'}) matches avg_slopes with x2 replaced."""
+    fit = smf.ols("y_ols ~ x1 + x2 + dummy", data=df_seed12345).fit()
+    M = Margins(fit)
+    ame = M.dydx("x1", values={"x2": "p25"})
+
+    ref = _read_r_csv(HERE / "r_dydx_at_p25.csv")
+    assert_allclose(ame.estimate[0], ref["estimate"].iloc[0], atol=1e-8)
+    assert_allclose(ame.se[0], ref["std.error"].iloc[0], atol=1e-6)

@@ -96,3 +96,45 @@ write_csv(coef_table, "r_coef.csv")
 # compute level-vs-reference comparisons and let Python build pairwise.
 comp_grp <- comparisons(fit_logit, variables = list(grp = "all"))
 write_csv(comp_grp, "r_comparisons.csv")
+
+# 0.5 fixtures ===============================================================
+# All 0.5 parity fixtures use OLS on df_b so estimates are linear-exact.
+fit_ols_b <- lm(y_ols ~ x1 + x2 + dummy, data = df_b)
+
+# 12. values={"x1": "p25"} -- prediction with x1 fixed at its 25th percentile,
+#     averaged over the rest of the data.
+df_b_p25 <- df_b
+df_b_p25$x1 <- as.numeric(quantile(df_b$x1, 0.25))
+pred_p25 <- avg_predictions(fit_ols_b, newdata = df_b_p25)
+write_csv(pred_p25, "r_values_p25.csv")
+
+# 13. values={"x1": [-1, 0, 1]} -- grid of three predictions, x1 fixed at
+#     each value, averaged over the rest.
+pred_grid <- avg_predictions(
+  fit_ols_b,
+  variables = list(x1 = c(-1, 0, 1))
+)
+write_csv(pred_grid, "r_values_grid.csv")
+
+# 14. newdata= -- average prediction over an out-of-sample frame.
+df_holdout <- tail(df_b, 20)
+pred_newdata <- avg_predictions(fit_ols_b, newdata = df_holdout)
+write_csv(pred_newdata, "r_newdata.csv")
+
+# 15. contrast(a={"dummy":1}, b={"dummy":0}) -- PATE (joint-SE difference).
+contrast_dummy <- avg_comparisons(
+  fit_ols_b,
+  variables = list(dummy = c(0, 1))
+)
+write_csv(contrast_dummy, "r_contrast_dummy.csv")
+
+# 16. dydx("x1", values={"x2": "p25"}) -- cross-feature: slope wrt x1 with
+#     x2 replaced by its 25th percentile.
+df_b_x2p25 <- df_b
+df_b_x2p25$x2 <- as.numeric(quantile(df_b$x2, 0.25))
+slopes_at_p25 <- avg_slopes(
+  fit_ols_b,
+  variables = "x1",
+  newdata = df_b_x2p25
+)
+write_csv(slopes_at_p25, "r_dydx_at_p25.csv")

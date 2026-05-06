@@ -17,6 +17,10 @@ API reference
     DiDResult
     WaldResult
     Transform
+    Expr
+    plot_predictions
+    plot_slopes
+    plot_comparisons
     transforms.Identity
     transforms.Linear
     transforms.Exp
